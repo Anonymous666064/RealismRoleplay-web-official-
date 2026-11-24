@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+	<title>Realism Roleplay</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+
+<body>
+	<!-- Your settings and your own .glb assets (optional, safe to delete) -->
+	<script src="realism-config.js?v=14"></script>
+	
+	<!-- Supabase multiplayer config (URL + anon key). Edit supabase-config.js. -->
+	<script src="supabase-config.js?v=1"></script>
+	
+	<!-- Supabase JS client (Realtime + Postgres). Loaded from CDN, no install needed. -->
+	<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+	
+	<!-- Game bundle -->
+	<script src="build/sketchbook.min.js?v=14"></script>
+	
+	<!-- Realism multiplayer framework (servers list, character creation, sync). No rebuild needed. -->
+	<script src="realism-multiplayer.js?v=1"></script>
+	
+	<script>
+		// Procedural San Verano County map. Use 'realism:<number>' for a different seed.
+		// Exposed as window.realismWorld so realism-multiplayer.js can hook into it.
+		window.realismWorld = new Sketchbook.World('realism');
+	</script>
+</body>
+
+</html>

@@ -1,0 +1,136 @@
+/* Realism Roleplay: money HUD, toast and the phone's Bank / Dealership / Garage / Jobs apps
+   (RealismEconomy.ts, RealismJobs.ts, RealismPhoneApps.ts). Same look as realismUI.css. */
+
+#rr-money {
+	position: fixed;
+	top: 14px;
+	right: 18px;
+	z-index: 9985;
+	min-width: 120px;
+	padding: 6px 12px 7px;
+	border-radius: 10px;
+	background: rgba(12, 15, 20, 0.62);
+	color: #fff;
+	font-family: 'Solway', Arial, sans-serif;
+	text-align: right;
+	pointer-events: none;
+	opacity: 0;
+	transform: translateY(-8px);
+	transition: opacity 0.25s, transform 0.25s;
+}
+#rr-money.rr-money-show { opacity: 1; transform: translateY(0); }
+.rr-money-row { font-size: 20px; font-weight: 700; line-height: 1.2; text-shadow: 0 1px 2px rgba(0,0,0,0.6); }
+.rr-money-cash { color: #7ee08a; }
+.rr-money-bankrow { font-size: 13px; color: #cfd6df; font-weight: 400; }
+.rr-money-delta { font-size: 13px; font-weight: 700; min-height: 0; }
+.rr-money-delta.rr-pos { color: #7ee08a; }
+.rr-money-delta.rr-neg { color: #ff7a6b; }
+
+#rr-toast {
+	position: fixed;
+	left: 50%;
+	top: 16%;
+	z-index: 10020;
+	transform: translateX(-50%);
+	max-width: 80vw;
+	padding: 8px 16px;
+	border-radius: 8px;
+	background: rgba(12, 15, 20, 0.75);
+	color: #ffd54a;
+	font: 700 16px 'Solway', Arial, sans-serif;
+	text-align: center;
+	pointer-events: none;
+	opacity: 0;
+	transition: opacity 0.2s;
+}
+#rr-toast.rr-toast-show { opacity: 1; }
+
+/* ---- shared bits inside the phone ---- */
+.rr-pa { padding: 8px 10px 14px; font-size: 13px; }
+.rr-pa h4 { margin: 12px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px; color: rgba(255,255,255,0.6); }
+.rr-pa-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.rr-pa-btns { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.rr-pa-btn {
+	flex: 1;
+	min-width: 0;
+	padding: 6px 8px;
+	border: none;
+	border-radius: 8px;
+	background: rgba(255,255,255,0.12);
+	color: #fff;
+	font: 600 12px 'Solway', Arial, sans-serif;
+	cursor: pointer;
+	white-space: nowrap;
+}
+.rr-pa-btn:hover:not([disabled]) { background: rgba(255,255,255,0.22); }
+.rr-pa-btn[disabled] { opacity: 0.4; cursor: default; }
+.rr-pa-btn.rr-go { background: #e8893a; }
+.rr-pa-btn.rr-go:hover:not([disabled]) { background: #f39a4e; }
+.rr-pa-btn.rr-bad { background: #a8382c; }
+.rr-pa-btn.rr-on { background: #2e7dd7; }
+.rr-pa-msg { margin-top: 8px; min-height: 16px; font-size: 12px; color: #ffd54a; }
+.rr-pa-msg.rr-err { color: #ff8a7a; }
+.rr-pa-input {
+	width: 100%;
+	box-sizing: border-box;
+	padding: 6px 8px;
+	border-radius: 8px;
+	border: 1px solid rgba(255,255,255,0.2);
+	background: rgba(0,0,0,0.35);
+	color: #fff;
+	font: 600 14px 'Solway', Arial, sans-serif;
+}
+.rr-pa-tabs { display: flex; gap: 4px; margin: 4px 0 6px; }
+.rr-pa-tabs .rr-pa-btn { padding: 4px 6px; }
+.rr-pos { color: #7ee08a; }
+.rr-neg { color: #ff8a7a; }
+.rr-sw { display: inline-block; width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.35); vertical-align: middle; }
+.rr-sw-btn { padding: 0; width: 20px; height: 20px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.25); cursor: pointer; }
+.rr-sw-btn.rr-sel { border-color: #fff; box-shadow: 0 0 0 2px #e8893a; }
+
+/* ---- Bank ---- */
+.rr-bankcard {
+	position: relative;
+	height: 136px;
+	border-radius: 12px;
+	padding: 12px 14px;
+	box-sizing: border-box;
+	color: #fff;
+	background: linear-gradient(135deg, #0f3b5f 0%, #1f6f8b 55%, #c9a24a 130%);
+	box-shadow: 0 6px 16px rgba(0,0,0,0.45);
+	overflow: hidden;
+	font-family: 'Cutive Mono', 'Courier New', monospace;
+}
+.rr-bankcard::after { content: ''; position: absolute; right: -40px; top: -50px; width: 160px; height: 160px; border-radius: 50%; background: rgba(255,255,255,0.08); }
+.rr-bankcard.rr-frozen { filter: grayscale(0.85) brightness(0.8); }
+.rr-bankcard-bank { font: 700 13px 'Solway', Arial, sans-serif; letter-spacing: 0.4px; }
+.rr-bankcard-type { position: absolute; right: 14px; top: 12px; font: 700 11px 'Solway', Arial, sans-serif; opacity: 0.85; }
+.rr-bankcard-chip { width: 30px; height: 22px; margin-top: 10px; border-radius: 4px; background: linear-gradient(135deg, #e9d48a, #b89a3e); }
+.rr-bankcard-num { margin-top: 8px; font-size: 16px; letter-spacing: 1.5px; }
+.rr-bankcard-foot { display: flex; justify-content: space-between; margin-top: 6px; font-size: 12px; }
+.rr-bankcard-ice { position: absolute; left: 0; right: 0; top: 50%; margin-top: -10px; text-align: center; font: 700 15px 'Solway', Arial, sans-serif; color: #bfe6ff; text-shadow: 0 1px 3px #000; }
+.rr-bal { display: flex; gap: 8px; margin-top: 10px; }
+.rr-bal > div { flex: 1; padding: 6px 8px; border-radius: 8px; background: rgba(255,255,255,0.07); }
+.rr-bal b { display: block; font-size: 16px; }
+.rr-tx { display: flex; justify-content: space-between; gap: 6px; padding: 6px 2px; border-bottom: 1px solid rgba(255,255,255,0.07); }
+.rr-tx-d { min-width: 0; }
+.rr-tx-t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+.rr-tx-a { font-weight: 700; white-space: nowrap; text-align: right; }
+
+/* ---- Dealership / Garage ---- */
+.rr-deal { padding: 8px 6px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+.rr-deal-name { font-weight: 700; font-size: 14px; }
+.rr-deal-price { font-weight: 700; color: #ffd27a; }
+.rr-deal-sw { display: flex; gap: 5px; flex-wrap: wrap; margin: 6px 0 2px; }
+.rr-gcar { padding: 8px 4px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+.rr-gcar .rr-pa-btns .rr-pa-btn { padding: 4px 5px; font-size: 11px; }
+.rr-confirm { padding: 10px; margin: 8px 0; border-radius: 10px; background: rgba(255,255,255,0.08); }
+
+/* ---- Jobs ---- */
+.rr-job { display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 6px; padding: 8px; border-radius: 10px; border: 2px solid transparent;
+	background: rgba(255,255,255,0.08); color: #fff; font: 600 13px 'Solway', Arial, sans-serif; text-align: left; cursor: pointer; }
+.rr-job.rr-sel { border-color: #e8893a; }
+.rr-job-ic { font-size: 22px; }
+.rr-job small { display: block; font-weight: 400; color: rgba(255,255,255,0.6); font-size: 11px; }
+.rr-badge { padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.08); }
+.rr-badge.rr-duty { background: rgba(46,125,215,0.35); }

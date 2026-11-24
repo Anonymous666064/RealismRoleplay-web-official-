@@ -1,0 +1,30 @@
+/* A17: street-crime overlays (hotwire / lab / kitchen minigames, shady menus, heat meter, hints, toasts). */
+.rl-ill-menu, .rl-ill-timing { position: fixed; inset: 0; z-index: 9400; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.35); font-family: Arial, Helvetica, sans-serif; color: #eee; }
+.rl-ill-panel { min-width: 320px; max-width: 460px; width: 90vw; background: rgba(14, 14, 20, 0.94); border: 1px solid rgba(255, 255, 255, 0.12); border-left: 4px solid #ff4fa8; border-radius: 8px; padding: 16px 18px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6); }
+.rl-ill-title { font-size: 18px; font-weight: bold; letter-spacing: 1.5px; color: #fff; }
+.rl-ill-sub { font-size: 12px; color: #aab; margin-top: 4px; }
+.rl-ill-cash { font-size: 13px; color: #7dff6a; margin: 8px 0; }
+.rl-ill-rows { display: flex; flex-direction: column; gap: 6px; max-height: 52vh; overflow-y: auto; }
+.rl-ill-row { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 9px 10px; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 6px; background: rgba(255, 255, 255, 0.05); color: #eee; font: inherit; font-size: 14px; cursor: pointer; }
+.rl-ill-row:hover { background: rgba(255, 79, 168, 0.18); }
+.rl-ill-row.off { opacity: 0.45; cursor: default; }
+.rl-ill-row.info { cursor: default; }
+.rl-ill-k { display: inline-block; min-width: 20px; padding: 1px 5px; border-radius: 4px; background: #2a2a36; color: #ffd27f; font-size: 12px; text-align: center; }
+.rl-ill-l { flex: 1; }
+.rl-ill-l small { display: block; font-size: 11px; color: #99a; }
+.rl-ill-r { color: #ffd27f; white-space: nowrap; }
+.rl-ill-close { margin-top: 12px; padding: 7px 12px; border: 0; border-radius: 5px; background: #333342; color: #ddd; cursor: pointer; font: inherit; font-size: 13px; }
+.rl-ill-msg { margin-top: 8px; font-size: 13px; color: #ffd27f; }
+.rl-ill-stage { margin: 10px 0 8px; font-size: 14px; color: #ddd; }
+.rl-ill-bar { position: relative; height: 26px; background: #22222c; border-radius: 5px; overflow: hidden; border: 1px solid rgba(255, 255, 255, 0.15); }
+.rl-ill-zone { position: absolute; top: 0; bottom: 0; background: rgba(80, 220, 110, 0.55); }
+.rl-ill-needle { position: absolute; top: -2px; bottom: -2px; width: 4px; margin-left: -2px; background: #fff; box-shadow: 0 0 6px #fff; }
+.rl-ill-prog { margin-top: 10px; height: 6px; background: #22222c; border-radius: 3px; overflow: hidden; }
+.rl-ill-prog i { display: block; height: 100%; width: 0; background: #ff4fa8; }
+.rl-ill-timing .rl-ill-sub { margin-top: 10px; }
+.rl-ill-heat { position: fixed; top: 14px; right: 16px; z-index: 9100; display: flex; align-items: center; gap: 3px; padding: 4px 8px; border-radius: 5px; background: rgba(0, 0, 0, 0.55); font: bold 11px Arial, sans-serif; color: #fff; pointer-events: none; }
+.rl-ill-heat b { margin-right: 4px; letter-spacing: 1px; }
+.rl-ill-heat i { width: 10px; height: 12px; border-radius: 2px; background: rgba(255, 255, 255, 0.18); }
+.rl-ill-heat i.on { background: #ff4040; box-shadow: 0 0 5px #ff4040; }
+.rl-ill-hint { position: fixed; left: 50%; bottom: 22%; transform: translateX(-50%); z-index: 9050; padding: 7px 14px; border-radius: 6px; background: rgba(0, 0, 0, 0.6); color: #fff; font: 14px Arial, sans-serif; pointer-events: none; }
+.rl-ill-toast { position: fixed; left: 50%; top: 18%; transform: translateX(-50%); z-index: 9200; max-width: 80vw; padding: 8px 16px; border-radius: 6px; background: rgba(14, 14, 20, 0.85); border-left: 3px solid #ff4fa8; color: #fff; font: 14px Arial, sans-serif; pointer-events: none; }
