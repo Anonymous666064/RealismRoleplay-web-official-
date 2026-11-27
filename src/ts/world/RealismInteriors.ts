@@ -43,6 +43,8 @@ export const FURNITURE: { [name: string]: Item } = {
 	bathSink: { w: 0.56, d: 0.46, h: 0.86 },
 	bathtub: { w: 1.7, d: 0.76, h: 0.56, solid: true },
 	desk: { w: 1.4, d: 0.7, h: 0.76, solid: true },
+	deskLamp: { w: 0.24, d: 0.24, h: 0.48 },
+	telephone: { w: 0.22, d: 0.2, h: 0.16 },
 	officeChair: { w: 0.6, d: 0.6, h: 1.05 },
 	shelf: { w: 1.8, d: 0.6, h: 1.6, solid: true },
 	checkout: { w: 1.8, d: 0.8, h: 1.0, solid: true },
@@ -242,6 +244,18 @@ function makeFurniture(ctx: RealismCtx, name: string, v: number): AssetPart[]
 			boxC(a, f, 0.1, H + 0.22, -0.15, 0.55, 0.35, 0.03, BLACK);
 			boxC(a, f, 0.1, H + 0.02, -0.15, 0.15, 0.04, 0.12, BLACK);
 			boxC(a, f, 0.1, H + 0.01, 0.12, 0.42, 0.02, 0.14, [0.2, 0.2, 0.2]);
+			break;
+		case 'deskLamp':
+			cyl(a, f, 0, 0.025, 0, 0.025, W * 0.42, D * 0.42, 10, BLACK, true);
+			cyl(a, f, 0, 0.19, 0, 0.22, 0.014, 0.014, 6, STEEL);
+			cyl(a, f, 0, 0.39, 0, 0.11, W * 0.46, D * 0.46, 8, [0.72, 0.7, 0.62], true);
+			cyl(g, f, 0, 0.35, 0, 0.015, W * 0.32, D * 0.32, 8, [1, 0.87, 0.58], true);
+			break;
+		case 'telephone':
+			boxC(a, f, 0, 0.045, 0, W * 0.92, 0.09, D * 0.88, BLACK);
+			boxC(a, f, 0, 0.095, -D * 0.1, W * 0.66, 0.018, D * 0.34, [0.18, 0.2, 0.22]);
+			boxC(s, f, 0, 0.135, -D * 0.18, W * 0.7, 0.035, 0.035, [0.2, 0.25, 0.3]);
+			boxC(a, f, 0, 0.12, D * 0.23, W * 0.8, 0.035, 0.055, STEEL);
 			break;
 		case 'officeChair':
 			cyl(a, f, 0, 0.05, 0, 0.4, 0.03, 0.03, 6, BLACK);
@@ -911,10 +925,25 @@ function fillCityRoom(F: RoomFiller, room: Room, hood: boolean, sub: string, kin
 			for (let z = room.z0 + 5; z < room.z1 - 2; z += 1.5) for (let x = room.x0 + 3; x < room.x1 - 3; x += 3.2) F.at('seatRow', x, z, Math.PI, 1);
 			break;
 		case 'police':
-			F.wall('receptionDesk', 'n', 0.5, 1, 1.0);
-			for (let x = room.x0 + 1.6; x < room.x1 - 1.6; x += 2.6) { F.at('desk', x, c[1] - 1, 0, 1); F.at('officeChair', x, c[1] - 1.6, 0); }
+		{
+			const reception = F.wall('receptionDesk', 'n', 0.5, 1, 1.0);
+			if (reception)
+			{
+				F.at('deskLamp', reception.cx + 0.82, reception.cz + 0.12, reception.rot, 0, true, room.y + 0.76);
+				F.at('telephone', reception.cx - 0.82, reception.cz + 0.12, reception.rot, 0, true, room.y + 0.76);
+				F.at('laptop', reception.cx - 0.28, reception.cz + 0.12, reception.rot, 0, true, room.y + 0.76);
+			}
+			for (let x = room.x0 + 1.6; x < room.x1 - 1.6; x += 2.6)
+			{
+				const deskZ = c[1] - 1;
+				F.at('desk', x, deskZ, 0, 1);
+				F.at('officeChair', x, c[1] - 1.6, 0);
+				F.at('deskLamp', x - 0.46, deskZ, 0, 0, true, room.y + FURNITURE.desk.h + 0.01);
+				F.at('telephone', x + 0.46, deskZ, 0, 0, true, room.y + FURNITURE.desk.h + 0.01);
+			}
 			F.wall('locker', 'we', 0.2); F.wall('seatRow', 's', 0.3);
 			break;
+		}
 		case 'cellblock':
 			break;   // cells, tables and guard post come from RealismLandmarks
 		case 'hangar':

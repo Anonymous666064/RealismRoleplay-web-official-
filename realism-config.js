@@ -23,7 +23,46 @@ window.REALISM_CONFIG = {
 	// Default is your GitHub repo through the jsDelivr CDN. Set to '' to turn the fallback off.
 	assetFallbackUrl: 'https://cdn.jsdelivr.net/gh/Anonymous666064/RealismRoleplay@main/Sketchbook-master/',
 
+	// Optional in-car MDT GLB. Position/rotation are in police-car local space; rotation is degrees.
+	// Leave model empty to use the built-in laptop. Adjust position/scale to fit your vehicle model.
+	police: {
+		mdtLaptop: {
+			model: '', // e.g. 'build/assets/police_mdt_laptop.glb'
+			position: [0, 0.62, 0.62],
+			rotation: [0, 180, 0],
+			scale: 0.72,
+		},
+	},
 
+	// Character model fitting (all measurements are metres in-game; no build required).
+	// height is the desired standing model height. scale is an extra visual multiplier.
+	// y and seatedY are vertical offsets in metres. seatedScale multiplies the standing
+	// visual scale while seated. Tweak each gender independently to fit your supplied GLB.
+	player: {
+		models: {
+			male: {
+				height: 1.70,
+				scale: 1.0,
+				y: 0,
+				seatedScale: 0.72,
+				seatedY: 0,
+			},
+			female: {
+				height: 1.68,
+				scale: 0.01,
+				y: 0,
+				seatedScale: 0.72,
+				seatedY: 0,
+			},
+			femaleAthlete: {
+				height: 1.70,
+				scale: 1.0,
+				y: 0,
+				seatedScale: 0.72,
+				seatedY: 0,
+			},
+		},
+	},
 
 	// Same seed = same map. Change it for a different county layout.
 	seed: 1337,

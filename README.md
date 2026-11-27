@@ -35,6 +35,20 @@ Mostly a playground for exploring how conventional third person gameplay mechani
 	* Cars
 	* Airplanes
 	* Helicopters
+* Law enforcement roleplay
+	* Police / sheriff duty and patrol vehicles
+	* Glock 19 service-pistol label, nonlethal NPC taser, handcuffs, flashlight and traffic cones
+	* In-vehicle MDT (`/`), in-vehicle radio (`R`), adjustable speed radar (`F6`), AI traffic stop request (`F7` in a patrol car), NPC conversation (`Q` on foot)
+	* Local MDT incident/citation records and dispatch board; five server-scoped text radio channels
+	* Furnished station reception desks and holding-cell doors restricted to on-duty law-enforcement jobs
+
+The phone's Jobs app remains the only police-job/duty interface. While on duty, `/` opens the MDT inside a police or sheriff vehicle, `R` opens the vehicle radio, `F6` toggles the in-car speed radar (set a 5-100 mph limit), and `F7` in a patrol car requests an AI traffic car ahead to signal and gradually pull toward the roadside. On foot, `Q` starts an NPC conversation when aiming at someone nearby. Radar reads simulated traffic and nearby live/synchronized vehicles visible to the client. `T` deploys the nonlethal taser, `Shift+T` reloads its cartridges, `C` handcuffs a stunned NPC (or releases a detained NPC), `L` toggles the flashlight (or operates a nearby door lock), and `B` / `Shift+B` deploy/remove traffic cones. NPC interviews provide preset questions, mixed truthful/deceptive roleplay answers and a consent/detention-aware simulated search.
+
+MDT records and NPC roleplay state are saved in the current browser only. Text radio can broadcast over the current multiplayer server's Realtime channel, but the existing game has no authenticated, trusted police backend; channel/dept restrictions and messages are therefore not server-authoritative. The radio is text-only; it does not yet include a vehicle CB/voice service. The traffic pull-over behavior applies to simulated AI traffic only, not player vehicles, and cannot guarantee a clear roadside shoulder.
+
+Police cars now mount a configurable MDT laptop GLB (or a built-in fallback), and the `/` MDT opening focuses the vehicle camera on it before showing the MDT. Set `REALISM_CONFIG.police.mdtLaptop.model`, `position`, `rotation`, and `scale` in [realism-config.js](./realism-config.js) to fit a supplied model. The underground station garages, traffic yielding around stopped patrol vehicles, and player restraint/search support are still pending.
+
+The multiplayer character editor now saves a male/female selection and uses the matching rigged model in `build/assets/characters/`. Adjust each model's `height`, `scale`, standing `y`, `seatedScale`, and `seatedY` under `REALISM_CONFIG.player.models` in [realism-config.js](./realism-config.js); these settings apply to the local player, multiplayer replicas, and matching NPC variants without changing the source GLBs. Heights are metres, `scale` is an additional multiplier, `seatedScale` multiplies the standing visual scale, and Y values are vertical offsets in metres. Save the config and hard-refresh; no build is needed for config-only edits. Player animations include walk/run plus generated idle, seated, driving, talking, and wave poses. Nearby NPCs use randomized supplied male/female GLB appearances with varied skin tones. Remote vehicles use the locally configured GLB for their vehicle type (or the matching stock car, helicopter, or airplane model). Clients need the same game build and `realism-config.js`/assets to see identical models; the game does not transfer model files between players.
 
 All planned features can be found in the [GitHub Projects](https://github.com/swift502/Sketchbook/projects).
 

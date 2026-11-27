@@ -178,6 +178,11 @@ export interface PerformancePreset
 export interface RealismSettings
 {
 	seed: number;
+	player?: {
+		scale?: number;
+		seatedScale?: number;
+		models?: { [gender: string]: { height?: number; scale?: number; y?: number; seatedScale?: number; seatedY?: number } };
+	};
 	performance: {
 		/** 'auto' picks low on phones/Chromebooks, medium on typical laptops, high on desktops. */
 		preset: string;

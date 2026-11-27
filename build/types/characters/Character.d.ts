@@ -27,6 +27,10 @@ export declare class Character extends THREE.Object3D implements IWorldEntity {
     velocity: THREE.Vector3;
     arcadeVelocityInfluence: THREE.Vector3;
     velocityTarget: THREE.Vector3;
+    /** Realism (A14): called at the end of every physics post step (swimming buoyancy). */
+    realismPostStep: (body: CANNON.Body) => void;
+    /** Realism (A14): first person eye height change while seated / lying (metres, negative = lower). */
+    realismEyeDrop: number;
     arcadeVelocityIsAdditive: boolean;
     defaultVelocitySimulatorDamping: number;
     defaultVelocitySimulatorMass: number;
@@ -57,9 +61,54 @@ export declare class Character extends THREE.Object3D implements IWorldEntity {
     controlledObject: IControllable;
     occupyingSeat: VehicleSeat;
     vehicleEntryInstance: VehicleEntryInstance;
+    /** Realism weapons: while set (aiming), the character faces this flat direction and strafes. */
+    aimDirection: THREE.Vector3;
+    /** Standing size multiplier: visuals, capsule, ray, camera distance. */
+    playerScale: number;
+    /** Size while sitting in a vehicle (the built-in vehicles are made for scale 1). */
+    seatedScale: number;
+    /** Walk / run / jump speed multiplier that goes with playerScale. */
+    speedFactor: number;
+    /** Visual size applied this frame (blends between playerScale and seatedScale). */
+    modelScale: number;
+    /** Normalizes imported character models to the original 1.024 m visual height. */
+    modelBaseScale: number;
+    modelBaseMinY: number;
+    modelFitScale: number;
+    modelFitY: number;
+    modelSeatedScale: number;
+    modelSeatedY: number;
+    realismGender: string;
+    /** Set by vehicle enter / exit states each frame: 0 = standing size, 1 = seated size. -1 = automatic. */
+    seatBlendOverride: number;
+    /** Gait speed multiplier; normalized imported models keep this at 1. */
+    loopAnimRate: number;
+    /** Third person camera distance at scale 1 (multiplied by playerScale). */
+    cameraDistanceBase: number;
+    /** First person (RealismFirstPerson.ts): while set, the body faces this flat direction at once and strafes. */
+    firstPersonLook: THREE.Vector3;
+    private fpMoveDir;
     private physicsEnabled;
     constructor(gltf: any);
-    setAnimations(animations: []): void;
+    setAnimations(animations?: any[], root?: THREE.Object3D): void;
+    /**
+     * Realism: resizes this character. scale 1 = original. Rebuilds the physics capsule (spheres from
+     * 0.07 * scale to 1.07 * scale above the feet, like the original 0.07..1.07), the ground ray, speeds,
+     * jump and the camera distance. `capsuleRadius` caps the capsule radius (metres) so a big character
+     * still fits through doorways; `speedFactor` defaults to sqrt(scale).
+     */
+    applyPlayerScale(scale: number, opts?: {
+        seatedScale?: number;
+        speedFactor?: number;
+        capsuleRadius?: number;
+    }): void;
+    setModelFit(settings: any): void;
+    /** Height offset above a vehicle entry / exit point for a STANDING character (original value `base`, made for scale 1). */
+    standOffsetY(base: number): number;
+    /** Height offset above a seat point for a SEATED character (original value `base`). Keeps the hips on the seat. */
+    seatOffsetY(base: number): number;
+    /** Applies the visual size for this frame: standing size, seated size, or the blend a vehicle state asked for. */
+    updateModelScale(): void;
     setArcadeVelocityInfluence(x: number, y?: number, z?: number): void;
     setViewVector(vector: THREE.Vector3): void;
     /**
@@ -75,6 +124,7 @@ export declare class Character extends THREE.Object3D implements IWorldEntity {
     setBehaviour(behaviour: ICharacterAI): void;
     setPhysicsEnabled(value: boolean): void;
     readCharacterData(gltf: any): void;
+    replaceModel(gltf: any): void;
     handleKeyboardEvent(event: KeyboardEvent, code: string, pressed: boolean): void;
     handleMouseButton(event: MouseEvent, code: string, pressed: boolean): void;
     handleMouseMove(event: MouseEvent, deltaX: number, deltaY: number): void;
@@ -90,6 +140,8 @@ export declare class Character extends THREE.Object3D implements IWorldEntity {
     springMovement(timeStep: number): void;
     springRotation(timeStep: number): void;
     getLocalMovementDirection(): THREE.Vector3;
+    /** Like getLocalMovementDirection, without allocating. */
+    getLocalMovementDirectionInto(out: THREE.Vector3): THREE.Vector3;
     getCameraRelativeMovementVector(): THREE.Vector3;
     setCameraRelativeOrientationTarget(): void;
     rotateModel(): void;

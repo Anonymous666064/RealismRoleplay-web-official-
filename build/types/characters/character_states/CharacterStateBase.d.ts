@@ -7,6 +7,8 @@ export declare abstract class CharacterStateBase implements ICharacterState {
     canFindVehiclesToEnter: boolean;
     canEnterVehicles: boolean;
     canLeaveVehicles: boolean;
+    /** Realism: a looping walk / run cycle whose playback rate follows the character's size and speed. */
+    scaledLoop: boolean;
     constructor(character: Character);
     update(timeStep: number): void;
     onInputChange(): void;

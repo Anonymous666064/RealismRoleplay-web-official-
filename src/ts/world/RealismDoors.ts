@@ -49,6 +49,7 @@ export interface DoorSpec
 	interior?: boolean;                   // room door (culled with the interiors)
 	label?: string;                       // shown in the prompt, e.g. "Door", "Garage"
 	privateHome?: boolean;                // NPC home (RealismNPCs): locked for good, prompt "Private residence"
+	lawEnforcementOnly?: boolean;          // requires an on-duty police or sheriff job
 }
 
 interface Door
@@ -71,6 +72,7 @@ interface Door
 	interior: boolean;
 	color: number[];
 	privateHome: boolean;
+	lawEnforcementOnly: boolean;
 	bIndex: number;      // building index from the group 'b<i>', -1 otherwise
 	owned: boolean;      // the player owns the building (C10)
 	orig: number;        // bit 1 privateHome, 2 fixed, 4 locked: state before it became owned
@@ -170,6 +172,7 @@ export class DoorSystem implements IUpdatable
 			batch: batch, v0: batch.doors.length * VERTS_PER_DOOR, partner: -1, bodies: [], moving: false, interior: interior,
 			color: spec.color || (kind === 'hinged' ? [0.45, 0.32, 0.22] : [0.72, 0.73, 0.72]),
 			privateHome: !!spec.privateHome,
+			lawEnforcementOnly: !!spec.lawEnforcementOnly,
 			bIndex: /^b\d+$/.test(spec.group || '') ? parseInt((spec.group as string).substring(1), 10) : -1,
 			owned: false, orig: 0,
 			ax: spec.x, az: spec.z, bx: spec.x + spec.width * c, bz: spec.z - spec.width * s,
@@ -424,6 +427,7 @@ export class DoorSystem implements IUpdatable
 	{
 		const d = this.doors[i];
 		if (d === undefined) return false;
+		if (d.lawEnforcementOnly && !this.hasLawEnforcementAccess()) { this.flash('Law enforcement only'); return false; }
 		if (d.locked) { this.flash(d.privateHome ? 'Private residence' : (d.fixed ? 'Boarded up' : 'Locked')); return false; }
 		this.promptKey = '';
 		const target = d.target > 0.5 ? 0 : 1;
@@ -444,6 +448,7 @@ export class DoorSystem implements IUpdatable
 	{
 		const d = this.doors[i];
 		if (d === undefined) return;
+		if (d.lawEnforcementOnly && !this.hasLawEnforcementAccess()) { this.flash('Law enforcement only'); return; }
 		if (d.privateHome) { this.flash('Private residence'); return; }
 		if (d.fixed) { this.flash(d.locked ? 'Boarded up' : 'This lock is broken'); return; }
 		const lock = !d.locked;
@@ -514,7 +519,7 @@ export class DoorSystem implements IUpdatable
 	public npcPass(i: number, hold: number = 1.6): void
 	{
 		const d = this.doors[i];
-		if (d === undefined || !this.finalized) return;
+		if (d === undefined || !this.finalized || d.lawEnforcementOnly) return;
 		this.setTarget(i, 1);
 		if (d.partner >= 0) this.setTarget(d.partner, 1);
 		for (let k = 0; k < this.npcCloses.length; k++) if (this.npcCloses[k].i === i) { this.npcCloses[k].t = hold; return; }
@@ -672,6 +677,12 @@ export class DoorSystem implements IUpdatable
 		return !ch.occupyingSeat && ch.controlledObject === undefined && !ch.vehicleEntryInstance;
 	}
 
+	private hasLawEnforcementAccess(): boolean
+	{
+		const job = (this.ctx.world as any).realismJob;
+		return !!(job && job.onDuty === true && (job.id === 'police' || job.id === 'sheriff'));
+	}
+
 	// -----------------------------------------------------------------------
 	// input + HUD
 	// -----------------------------------------------------------------------
@@ -723,7 +734,8 @@ export class DoorSystem implements IUpdatable
 		if (i >= 0)
 		{
 			const d = this.doors[i];
-			const state = d.privateHome ? 'p' : (d.fixed && d.locked ? 'b' : (d.locked ? 'l' : (d.target > 0.5 ? 'c' : 'o')));
+			const state = (d.lawEnforcementOnly && !this.hasLawEnforcementAccess() ? 'x' : '') +
+				(d.privateHome ? 'p' : (d.fixed && d.locked ? 'b' : (d.locked ? 'l' : (d.target > 0.5 ? 'c' : 'o'))));
 			key = i + state;
 		}
 		if (key === this.promptKey) return;
@@ -731,7 +743,8 @@ export class DoorSystem implements IUpdatable
 		if (i < 0) { pr.set('doors', null); return; }
 		const d = this.doors[i];
 		let items: { key: string; label: string }[];
-		if (d.privateHome) items = PROMPT_PRIVATE;
+		if (d.lawEnforcementOnly && !this.hasLawEnforcementAccess()) items = [{ key: '', label: 'Law enforcement access only' }];
+		else if (d.privateHome) items = PROMPT_PRIVATE;
 		else if (d.fixed && d.locked) items = [{ key: '', label: d.label + ': boarded up' }];
 		else if (d.locked) items = PROMPT_LOCKED;
 		else items = d.target > 0.5 ? PROMPT_CLOSE : PROMPT_OPEN;

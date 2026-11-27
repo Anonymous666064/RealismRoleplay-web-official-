@@ -16,7 +16,14 @@ export declare class InputManager implements IUpdatable {
     boundOnPointerlockError: (evt: any) => void;
     boundOnKeyDown: (evt: any) => void;
     boundOnKeyUp: (evt: any) => void;
+    private pressedKeys;
+    private pressedButtons;
+    private wasBlocking;
     constructor(world: World, domElement: HTMLElement);
+    /** True while a Realism menu / the phone / another UI owner blocks gameplay input. */
+    get uiBlocking(): boolean;
+    /** Releases every key and mouse button the receiver still thinks is held (character stops walking). */
+    releaseAll(): void;
     update(timestep: number, unscaledTimeStep: number): void;
     setInputReceiver(receiver: IInputReceiver): void;
     setPointerLock(enabled: boolean): void;

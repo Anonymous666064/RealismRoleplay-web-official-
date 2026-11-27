@@ -38,7 +38,8 @@ import { TreeLOD } from './RealismTreeLOD';
 import { VegModelSet, VegEntry, PreparedModel, ChunkInstances, VARIANT_STRIDE, hash01, lateColliders, vegSettings, vegModelStats } from './RealismVegetationModels';
 import { buildHoodDetails } from './RealismHoodDetails';
 import { DoorSystem } from './RealismDoors';
-import { buildNPCs } from './RealismNPCs';
+import { buildNPCs, loadSharedModel } from './RealismNPCs';
+import { SkeletonUtils } from 'three/examples/jsm/utils/SkeletonUtils';
 import { attachRealismUI } from './RealismUI';
 import { buildCarLights } from './RealismCarLights';
 import { buildTraffic } from './RealismTraffic';
@@ -57,6 +58,7 @@ import { buildHud } from './RealismMinimap';
 import { buildInternet } from './RealismLaptop';
 import { buildLegalJobs } from './RealismJobsLegal';
 import { buildIllegal } from './RealismIllegal';
+import { RealismLawEnforcement } from './RealismLawEnforcement';
 const PHYS_CHUNK = 128;     // metres, compound static colliders (terrain props, trees, lamps)
 const BPHYS_CHUNK = 64;     // metres, building shells (many small boxes)
 
@@ -83,6 +85,52 @@ export function buildRealismWorld(world: World, seed?: number): void
 		w.realismMap = data;
 		w.realismSettings = cfg;
 		w.realismVehicleTypes = cfg.vehicles.types;
+		w.realismLoadPlayerModel = (gender: string, done: (model: any) => void, failed?: () => void): void =>
+		{
+			const path = gender === 'female' ? 'build/assets/characters/female.glb' : 'build/assets/characters/male.glb';
+			loadSharedModel(path, (gltf) =>
+			{
+				done({ scene: SkeletonUtils.clone(gltf.scene), animations: gltf.animations || [] });
+			}, failed);
+		};
+		w.realismLoadVehicleModel = (type: string, done: (model: THREE.Object3D) => void, failed?: () => void): void =>
+		{
+			const vehicleTypes: any = cfg.vehicles.types || {};
+			const definition = Object.prototype.hasOwnProperty.call(vehicleTypes, type) ? vehicleTypes[type] : null;
+			const configuredModel = definition && typeof definition.model === 'string' ? definition.model : '';
+			const configuredBase = definition && typeof definition.base === 'string' ? definition.base : type;
+			const base = ['car', 'heli', 'airplane'].indexOf(configuredBase) >= 0 ? configuredBase : 'car';
+			const basePath = definition && definition.sketchbookFormat !== false && configuredModel
+				? configuredModel
+				: 'build/assets/' + base + '.glb';
+			const cloneScene = (gltf: any): THREE.Object3D =>
+			{
+				const model = gltf.scene.clone(true);
+				model.traverse((node: any) =>
+				{
+					if (!node.isMesh || !node.material) return;
+					node.material = Array.isArray(node.material) ? node.material.map((material: THREE.Material) => material.clone()) : node.material.clone();
+				});
+				return model;
+			};
+			loadSharedModel(basePath, (gltf) =>
+			{
+				const model = cloneScene(gltf);
+				if (!definition || definition.sketchbookFormat !== false || !configuredModel)
+				{
+					done(model);
+					return;
+				}
+				loadSharedModel(configuredModel, (bodyGltf) =>
+				{
+					const wrapper = new THREE.Group();
+					wrapper.applyMatrix4(overrideMatrix(definition));
+					wrapper.add(cloneScene(bodyGltf));
+					model.add(wrapper);
+					done(model);
+				}, failed);
+			}, failed);
+		};
 
 		world.graphicsWorld.fog = new THREE.Fog(0xbccfe0, 380, 1000);
 
@@ -196,6 +244,7 @@ export function buildRealismWorld(world: World, seed?: number): void
 		console.log('[Realism] World built', summary);
 
 		attachRealismUI(world, ctx, loadingManager);   // menus, settings, phone, day / night
+		new RealismLawEnforcement(ctx);   // local police equipment, reports, radio and dispatch
 		buildScenarios(ctx, loadingManager);
 	}, 50);
 }

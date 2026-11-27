@@ -108,11 +108,12 @@ export class LandmarkBuilder
 	}
 
 	/** Prison / jail cell row along local x (front of the cells faces +z). */
-	private cellRow(f: Frame, x0: number, x1: number, zBack: number, depth: number, y: number, h: number, cellW: number, physRot: number, open: boolean): number
+	private cellRow(f: Frame, x0: number, x1: number, zBack: number, depth: number, y: number, h: number, cellW: number, physRot: number, open: boolean, staffOnly: boolean = false): number
 	{
 		const n = Math.floor((x1 - x0) / cellW);
 		const a = this.acc('plain', f.x, f.z);
 		const zf = zBack + depth;
+		const controlledDoors = staffOnly && !!this.ctx.doors;
 		const wallC = [0.78, 0.77, 0.72];
 		const p = (lx: number, ly: number, lz: number) => f.p(lx, ly, lz);
 		// back wall + ceiling slab are the building's; dividers + bars here
@@ -127,7 +128,7 @@ export class LandmarkBuilder
 		{
 			const cx = x0 + (k + 0.5) * cellW;
 			// bars with a door (left 0.9 m); some doors stand open
-			const doorOpen = open || hash01(Math.floor(f.x * 31 + f.z * 17 + k * 13 + y * 7)) < 0.35;
+			const doorOpen = controlledDoors || open || hash01(Math.floor(f.x * 31 + f.z * 17 + k * 13 + y * 7)) < 0.35;
 			const bx0 = x0 + k * cellW + 0.08, bx1 = x0 + (k + 1) * cellW - 0.08;
 			for (let bx = bx0 + 0.1; bx < bx1 - 0.05; bx += 0.14)
 			{
@@ -136,7 +137,16 @@ export class LandmarkBuilder
 			}
 			box(a, f, bx0, y + h - 0.12, zf - 0.04, bx1, y + h - 0.02, zf + 0.04, BARS);
 			box(a, f, bx0, y + 1.05, zf - 0.03, bx1, y + 1.1, zf + 0.03, BARS);
-			if (doorOpen) box(a, f, bx0 - 0.02, y, zf + 0.05, bx0 + 0.02, y + h - 0.15, zf + 0.95, BARS);  // swung-open door
+			if (doorOpen && !controlledDoors) box(a, f, bx0 - 0.02, y, zf + 0.05, bx0 + 0.02, y + h - 0.15, zf + 0.95, BARS);  // swung-open door
+			if (controlledDoors)
+			{
+				const hinge = p(bx0, y, zf);
+				this.ctx.doors.add({
+					kind: 'hinged', x: hinge[0], y: y + 0.01, z: hinge[2], rot: physRot,
+					width: 0.9, height: h - 0.06, thickness: 0.06, color: [0.36, 0.38, 0.4],
+					locked: true, interior: true, lawEnforcementOnly: true, label: 'Holding cell',
+				});
+			}
 			const solid = doorOpen ? [[bx0 + 0.95, bx1]] : [[bx0, bx1]];
 			for (let s = 0; s < solid.length; s++)
 			{
@@ -173,7 +183,7 @@ export class LandmarkBuilder
 			{
 				const width = Math.min(3 * 2.6, (main.x1 - main.x0) * 0.4);
 				const x1 = main.x1, x0 = x1 - width;
-				this.cellRow(f, x0, x1, main.z0, 2.6, floorY, Math.min(3.0, main.h - 0.1), 2.6, b.rot, false);
+				this.cellRow(f, x0, x1, main.z0, 2.6, floorY, Math.min(3.0, main.h - 0.1), 2.6, b.rot, false, true);
 				// armoury cage in the other back corner
 				const a = this.acc('plain', b.x, b.z);
 				const cx0 = main.x0, cx1 = main.x0 + 3.2, cz0 = main.z0, cz1 = main.z0 + 2.4;

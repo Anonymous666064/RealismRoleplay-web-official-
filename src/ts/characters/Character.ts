@@ -95,9 +95,17 @@ export class Character extends THREE.Object3D implements IWorldEntity
 	public speedFactor: number = 1;
 	/** Visual size applied this frame (blends between playerScale and seatedScale). */
 	public modelScale: number = 1;
+	/** Normalizes imported character models to the original 1.024 m visual height. */
+	public modelBaseScale: number = 1;
+	public modelBaseMinY: number = 0;
+	public modelFitScale: number = 1;
+	public modelFitY: number = 0;
+	public modelSeatedScale: number = 0.72;
+	public modelSeatedY: number = 0;
+	public realismGender: string = 'male';
 	/** Set by vehicle enter / exit states each frame: 0 = standing size, 1 = seated size. -1 = automatic. */
 	public seatBlendOverride: number = -1;
-	/** Walk / run cycle playback rate, so the feet don't slide at a different size / speed. */
+	/** Gait speed multiplier; normalized imported models keep this at 1. */
 	public loopAnimRate: number = 1;
 	/** Third person camera distance at scale 1 (multiplied by playerScale). */
 	public cameraDistanceBase: number = 1.6;
@@ -111,8 +119,13 @@ export class Character extends THREE.Object3D implements IWorldEntity
 	{
 		super();
 
+		gltf.scene.updateMatrixWorld(true);
+		const modelBounds = new THREE.Box3().setFromObject(gltf.scene);
+		this.height = modelBounds.max.y - modelBounds.min.y;
+		this.modelBaseMinY = modelBounds.min.y;
+		this.modelBaseScale = Number.isFinite(this.height) && this.height > 0 ? 1.024 / this.height : 1;
 		this.readCharacterData(gltf);
-		this.setAnimations(gltf.animations);
+		this.setAnimations(gltf.animations, gltf.scene);
 
 		// The visuals group is centered for easy character tilting
 		this.tiltContainer = new THREE.Group();
@@ -123,6 +136,8 @@ export class Character extends THREE.Object3D implements IWorldEntity
 		this.modelContainer.position.y = -0.57;
 		this.tiltContainer.add(this.modelContainer);
 		this.modelContainer.add(gltf.scene);
+		this.modelContainer.scale.setScalar(this.modelBaseScale);
+		this.modelContainer.position.y = -0.57 - this.modelBaseMinY * this.modelBaseScale;
 
 		this.mixer = new THREE.AnimationMixer(gltf.scene);
 
@@ -187,9 +202,62 @@ export class Character extends THREE.Object3D implements IWorldEntity
 		this.setState(new Idle(this));
 	}
 
-	public setAnimations(animations: []): void
+	public setAnimations(animations: any[] = [], root?: THREE.Object3D): void
 	{
-		this.animations = animations;
+		this.animations = (animations || []).slice();
+		if (!root) return;
+
+		const bones: { [name: string]: THREE.Bone } = {};
+		root.traverse((node: any) => { if (node.isBone) bones[node.name] = node; });
+		const times = [0, 0.5, 1];
+		const addRotation = (tracks: THREE.KeyframeTrack[], name: string, axis: THREE.Vector3, angle: number, oscillate: boolean): void =>
+		{
+			const bone = bones[name];
+			if (!bone) return;
+			const values: number[] = [];
+			const phases = oscillate ? [-1, 1, -1] : [1, 1, 1];
+			for (let i = 0; i < phases.length; i++)
+			{
+				const offset = new THREE.Quaternion().setFromAxisAngle(axis, angle * phases[i]);
+				const pose = bone.quaternion.clone().multiply(offset);
+				values.push(pose.x, pose.y, pose.z, pose.w);
+			}
+			tracks.push(new THREE.QuaternionKeyframeTrack(name + '.quaternion', times, values));
+		};
+		const addClip = (name: string, tracks: THREE.KeyframeTrack[]): void =>
+		{
+			if (!this.animations.some((clip) => clip && String(clip.name).toLowerCase() === name.toLowerCase()))
+				this.animations.push(new THREE.AnimationClip(name, 1, tracks));
+		};
+
+		const idleTracks: THREE.KeyframeTrack[] = [];
+		addRotation(idleTracks, 'Spine', new THREE.Vector3(0, 0, 1), 0.018, true);
+		addRotation(idleTracks, 'Head', new THREE.Vector3(0, 0, 1), 0.012, true);
+		addClip('idle', idleTracks);
+
+		const seatedTracks: THREE.KeyframeTrack[] = [];
+		addRotation(seatedTracks, 'LeftUpLeg', new THREE.Vector3(1, 0, 0), 0.9, false);
+		addRotation(seatedTracks, 'RightUpLeg', new THREE.Vector3(1, 0, 0), 0.9, false);
+		addRotation(seatedTracks, 'LeftLeg', new THREE.Vector3(1, 0, 0), -1.35, false);
+		addRotation(seatedTracks, 'RightLeg', new THREE.Vector3(1, 0, 0), -1.35, false);
+		addClip('sitting', seatedTracks);
+
+		const drivingTracks: THREE.KeyframeTrack[] = [];
+		addRotation(drivingTracks, 'LeftArm', new THREE.Vector3(0, 0, 1), -0.45, false);
+		addRotation(drivingTracks, 'RightArm', new THREE.Vector3(0, 0, 1), 0.45, false);
+		addRotation(drivingTracks, 'LeftForeArm', new THREE.Vector3(1, 0, 0), -0.65, false);
+		addRotation(drivingTracks, 'RightForeArm', new THREE.Vector3(1, 0, 0), -0.65, false);
+		addClip('driving', drivingTracks);
+
+		const talkingTracks: THREE.KeyframeTrack[] = [];
+		addRotation(talkingTracks, 'Head', new THREE.Vector3(0, 1, 0), 0.035, true);
+		addRotation(talkingTracks, 'LeftArm', new THREE.Vector3(0, 0, 1), 0.12, true);
+		addClip('talking', talkingTracks);
+
+		const waveTracks: THREE.KeyframeTrack[] = [];
+		addRotation(waveTracks, 'RightArm', new THREE.Vector3(0, 0, 1), 0.75, true);
+		addRotation(waveTracks, 'RightForeArm', new THREE.Vector3(0, 1, 0), 0.5, true);
+		addClip('wave', waveTracks);
 	}
 
 	/**
@@ -206,8 +274,7 @@ export class Character extends THREE.Object3D implements IWorldEntity
 		this.seatedScale = Math.max(0.3, Math.min(3, Number(o.seatedScale) || 1));
 		this.speedFactor = Math.max(0.3, Math.min(3, Number(o.speedFactor) || Math.sqrt(s)));
 		this.moveSpeed = 4 * this.speedFactor;
-		// legs are `s` times longer and move `speedFactor` times faster: cycle rate = speedFactor / s
-		this.loopAnimRate = this.speedFactor / s;
+		this.loopAnimRate = 1;
 		this.rayCastLength = 0.57 * s;
 		this.raySafeOffset = 0.03 * s;
 
@@ -235,10 +302,37 @@ export class Character extends THREE.Object3D implements IWorldEntity
 		this.characterCapsule.options.radius = r;
 		this.characterCapsule.options.height = half * 2;
 		this.updateModelScale();
+		if (!(this as any).__realismFitLogged)
+		{
+			(this as any).__realismFitLogged = true;
+			console.info('[Realism] Player model auto-fit',
+				'raw height', this.height.toFixed(3) + 'm',
+				'on foot', (this.height * this.modelBaseScale * this.modelFitScale).toFixed(2) + 'm',
+				'in vehicle', (this.height * this.modelBaseScale * this.modelFitScale * this.modelSeatedScale).toFixed(2) + 'm');
+		}
 		if (this.world !== undefined && this.world.inputManager !== undefined && this.world.inputManager.inputReceiver === this)
 		{
 			this.world.cameraOperator.setRadius(this.cameraDistanceBase * s);
 		}
+	}
+
+	public setModelFit(settings: any): void
+	{
+		const fit = settings && typeof settings === 'object' ? settings : {};
+		const height = Number(fit.height);
+		const scale = Number(fit.scale);
+		const seatedScale = Number(fit.seatedScale);
+		this.modelBaseScale = Number.isFinite(height) && height > 0 && this.height > 0
+			? height / this.height
+			: (this.height > 0 ? 1.024 / this.height : 1);
+		this.modelFitScale = Number.isFinite(scale) && scale > 0 ? Math.max(0.01, Math.min(5, scale)) : 1;
+		this.modelFitY = Number.isFinite(Number(fit.y)) ? Math.max(-3, Math.min(3, Number(fit.y))) : 0;
+		this.modelSeatedScale = Number.isFinite(seatedScale) && seatedScale > 0
+			? Math.max(0.01, Math.min(5, seatedScale))
+			: 0.72;
+		this.modelSeatedY = Number.isFinite(Number(fit.seatedY)) ? Math.max(-3, Math.min(3, Number(fit.seatedY))) : 0;
+		this.updateModelScale();
+		(this as any).__realismFitLogged = false;
 	}
 
 	/** Height offset above a vehicle entry / exit point for a STANDING character (original value `base`, made for scale 1). */
@@ -259,13 +353,14 @@ export class Character extends THREE.Object3D implements IWorldEntity
 	{
 		let blend = this.seatBlendOverride;
 		if (blend < 0) blend = (this.occupyingSeat !== null && !this.physicsEnabled) ? 1 : 0;
-		const sc = this.playerScale + (this.seatedScale - this.playerScale) * Math.max(0, Math.min(1, blend));
+		blend = Math.max(0, Math.min(1, blend));
+		const sc = this.playerScale + (this.seatedScale - this.playerScale) * blend;
 		this.modelScale = sc;
-		if (this.modelContainer.scale.x !== sc)
-		{
-			this.modelContainer.scale.set(sc, sc, sc);
-			this.modelContainer.position.y = -0.57 * sc;
-		}
+		const seatScale = 1 + (this.modelSeatedScale - 1) * blend;
+		const visualScale = this.modelBaseScale * this.modelFitScale * seatScale;
+		this.modelContainer.scale.set(visualScale, visualScale, visualScale);
+		const yOffset = this.modelFitY + (this.modelSeatedY - this.modelFitY) * blend;
+		this.modelContainer.position.y = -0.57 * sc - this.modelBaseMinY * visualScale + yOffset;
 	}
 
 	public setArcadeVelocityInfluence(x: number, y: number = x, z: number = x): void
@@ -378,6 +473,32 @@ export class Character extends THREE.Object3D implements IWorldEntity
 				}
 			}
 		});
+	}
+
+	public replaceModel(gltf: any): void
+	{
+		if (!gltf || !gltf.scene) throw new Error('Cannot replace character model: missing scene.');
+
+		if (this.mixer)
+		{
+			this.mixer.stopAllAction();
+			this.mixer.uncacheRoot(this.mixer.getRoot());
+		}
+		while (this.modelContainer.children.length) this.modelContainer.remove(this.modelContainer.children[0]);
+		this.materials = [];
+		gltf.scene.updateMatrixWorld(true);
+		const bounds = new THREE.Box3().setFromObject(gltf.scene);
+		const height = bounds.max.y - bounds.min.y;
+		this.height = height;
+		this.modelBaseMinY = bounds.min.y;
+		this.readCharacterData(gltf);
+		this.setAnimations(gltf.animations, gltf.scene);
+		this.modelContainer.add(gltf.scene);
+		this.mixer = new THREE.AnimationMixer(gltf.scene);
+		this.updateModelScale();
+		(this as any).__realismScaleVersion = -1;
+		(this as any).__rrmpSkin = null;
+		this.setAnimation('idle', 0.15);
 	}
 
 	public handleKeyboardEvent(event: KeyboardEvent, code: string, pressed: boolean): void
@@ -626,19 +747,49 @@ export class Character extends THREE.Object3D implements IWorldEntity
 	{
 		if (this.mixer !== undefined)
 		{
-			// gltf
-			let clip = THREE.AnimationClip.findByName( this.animations, clipName );
-
-			let action = this.mixer.clipAction(clip);
-			if (action === null)
+			const clips = this.animations || [];
+			let clip = THREE.AnimationClip.findByName(clips, clipName);
+			if (!clip)
 			{
-				console.error(`Animation ${clipName} not found!`);
-				return 0;
+				clip = clips.find((item) => item && String(item.name).toLowerCase() === clipName.toLowerCase());
 			}
+			if (!clip)
+			{
+				const aliases: { [name: string]: string[] } = {
+					sprint: ['run', 'walk'],
+					jump_idle: ['run', 'walk'],
+					jump_running: ['run', 'walk'],
+					falling: ['run', 'walk'],
+					talking: ['idle', 'walk'],
+					driving: ['sitting', 'idle'],
+					sitting: ['idle', 'walk'],
+					sit_down_left: ['sitting', 'walk'],
+					sit_down_right: ['sitting', 'walk'],
+					sitting_shift_left: ['sitting', 'idle'],
+					sitting_shift_right: ['sitting', 'idle'],
+					stand_up_left: ['walk', 'idle'],
+					stand_up_right: ['walk', 'idle'],
+					start_back_left: ['walk'],
+					start_back_right: ['walk'],
+					start_forward: ['walk'],
+					start_left: ['walk'],
+					start_right: ['walk'],
+				};
+				const fallbacks = aliases[clipName] || ['walk', 'run'];
+				for (let i = 0; i < fallbacks.length && !clip; i++)
+				{
+					clip = THREE.AnimationClip.findByName(clips, fallbacks[i]) ||
+						clips.find((item) => item && String(item.name).toLowerCase() === fallbacks[i]);
+				}
+			}
+			if (!clip) return 0;
 
+			const action = this.mixer.clipAction(clip);
 			this.mixer.stopAllAction();
+			action.reset();
 			action.fadeIn(fadeIn);
 			action.play();
+			action.setEffectiveTimeScale(1);
 
 			return action.getClip().duration;
 		}

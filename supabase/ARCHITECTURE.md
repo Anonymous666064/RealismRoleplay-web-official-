@@ -81,8 +81,9 @@ channel: `server:<server_id>`. That channel carries three things:
 | Feature | Use |
 | --- | --- |
 | **Presence** | online roster: `{ id, name, skinColor }`. Drives avatar spawn/remove and the live player count. |
-| **Broadcast** `pos` | transform updates: `{ id, t:[x,y,z], r:yaw, m:motion }`, sent at ~20 Hz. Ephemeral. |
-| **Broadcast** `chat` | (reserved) text chat. |
+| **Broadcast** `move` | player transforms and driven-vehicle pose, sent at up to 20 Hz. Ephemeral. |
+| **Broadcast** `shot` | weapon hit rays, checked against each receiver's local player and world collision. Ephemeral. |
+| **Broadcast** `death` | elimination notices for the in-session kill/death HUD. Ephemeral. |
 
 No Postgres Changes subscription is needed for transforms — Broadcast is far
 cheaper. The servers list is refreshed by polling the `servers` table every 5 s
@@ -176,7 +177,9 @@ re-applied whenever the local character changes (e.g. after Shift+R respawn).
    `joinServer()` inserts/refreshes a `server_sessions` row, joins the
    `server:<id>` Realtime channel, starts presence + broadcast, then calls
    `world.realismUI.play()`.
-4. Remote players appear as avatars; their transforms update in real time.
+4. The game starts after connecting. Remote players appear as avatars; their
+   transforms and driven vehicles update in real time. Weapon hits reduce
+   player health and trigger a delayed respawn on elimination.
 5. **Leave** (status HUD) or close tab → session row deleted (best-effort
    `sendBeacon`), channel unsubscribed, avatars removed.
 

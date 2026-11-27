@@ -80,10 +80,16 @@ the jsDelivr CDN.
 3. Click **Online** → you'll see the 3 default servers with `0 / 24` players →
    **Join** one.
 4. Open the game in a **second browser tab** (or a different device / browser)
-   and join the same server. You should see each other as avatars with floating
-   name tags, moving in real time.
-5. The top-center HUD shows the server name and online count; **Leave** exits.
-6. Try **Create Server** (public or private with a code) and **Join by Code**.
+   and join the same server. Joining starts the game; you should see each other
+   as avatars with floating name tags, moving in real time.
+5. Players can damage each other with weapon slots (including fists). Health,
+   kills, and deaths appear in the online HUD; eliminated players respawn after
+   a short delay.
+6. Players seated in the same spawned vehicle see its synchronized position
+   and each other riding in it. A shared vehicle proxy is shown if there is no
+   matching local vehicle.
+7. The top-center HUD shows the server name and online count; **Leave** exits.
+8. Try **Create Server** (public or private with a code) and **Join by Code**.
 
 Open the browser console (F12) and filter for `[RRMP]` to see join/leave/sync
 logs. Set `multiplayer.verbose: true` in `supabase-config.js` for more detail.
@@ -96,7 +102,8 @@ logs. Set `multiplayer.verbose: true` in `supabase-config.js` for more detail.
 - **Player count** = live count of `server_sessions` rows with a heartbeat in
   the last 30 seconds (computed by the `list_servers()` SQL function).
 - **Real-time sync** = Supabase Realtime: **Presence** tracks who's online,
-  **Broadcast** streams player positions at 20 Hz without touching the database.
+  **Broadcast** streams player and driven-vehicle transforms at up to 20 Hz,
+  and relays weapon hit rays without touching the database.
 - **Identity** = a UUID + your chosen name/skin, stored in `localStorage`.
   No login required for the MVP.
 - **Remote players** = lightweight tinted capsule + head + name tag, lerped to

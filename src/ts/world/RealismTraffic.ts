@@ -176,6 +176,8 @@ interface TCar
 	prevV: number;
 	brakeT: number;           // brake lights stay on this long (no flicker)
 	sig: number;              // -1 left, 1 right, 0 off
+	pullOverS: number;
+	pullOverOffset: number;
 }
 
 interface Jacked { car: Car; rgb: number[]; claimed: boolean; t: number; pending?: boolean; }
@@ -819,6 +821,8 @@ export class RealismTraffic
 		const front = car.s + len / 2;
 		const remaining = L.len - front;
 		let gap = 1e9;
+		if (car.pullOverS >= 0 && car.pullOverOffset >= 1.15)
+			gap = Math.min(gap, car.pullOverS - front);
 		// cars ahead on this lane, the next lane and the one after
 		const n1 = car.next, n2 = n1 >= 0 && this.lanes[n1].next.length === 1 ? this.lanes[n1].next[0] : -1;
 		const len1 = n1 >= 0 ? this.lanes[n1].len : 0;
@@ -846,6 +850,21 @@ export class RealismTraffic
 			else if (remaining < Math.max(3, car.v * 0.6)) car.go = car.lane;
 		}
 		else if (n1 < 0) gap = Math.min(gap, remaining - 0.3);
+		if (car.pullOverS >= 0)
+		{
+			const sideX = car.x + car.hz * 1.15;
+			const sideZ = car.z - car.hx * 1.15;
+			let clear = true;
+			for (let i = 0; i < this.cars.length; i++)
+			{
+				const other = this.cars[i];
+				if (other === car) continue;
+				const dx = other.x - sideX, dz = other.z - sideZ;
+				if (dx * dx + dz * dz < 9) { clear = false; break; }
+			}
+			if (clear) car.pullOverOffset = Math.min(1.15, car.pullOverOffset + dt * 0.8);
+			car.sig = 1;
+		}
 		// people, the player and real cars in front
 		const look = 7 + car.v * 1.6;
 		const rx = -car.hz, rz = car.hx;
@@ -874,8 +893,9 @@ export class RealismTraffic
 		const limit = L.limit * (car.panicT > 0 ? 1.5 : 1);
 		const vSafe = gap >= 1e8 ? 1e9 : Math.sqrt(Math.max(0, 2 * BRAKE * (gap - MIN_GAP)));
 		const target = Math.min(limit, vSafe);
-		if (target > car.v) car.v = Math.min(target, car.v + ACCEL * (car.panicT > 0 ? 1.6 : 1) * dt);
-		else car.v = Math.max(target, car.v - 9 * dt);
+		const pullOverTarget = car.pullOverS >= 0 && car.pullOverOffset < 1.15 ? Math.min(target, 5.5) : target;
+		if (pullOverTarget > car.v) car.v = Math.min(pullOverTarget, car.v + ACCEL * (car.panicT > 0 ? 1.6 : 1) * dt);
+		else car.v = Math.max(pullOverTarget, car.v - 9 * dt);
 		if (vSafe < car.v) car.v = vSafe;
 		// never close a gap below the minimum within this step
 		if (gap < 1e8 && car.v * dt > gap - MIN_GAP * 0.5) car.v = Math.max(0, (gap - MIN_GAP * 0.5) / Math.max(dt, 1e-4));
@@ -955,6 +975,11 @@ export class RealismTraffic
 		car.hx = Math.sin(car.yaw); car.hz = Math.cos(car.yaw);
 		car.pitch = hl > 0.05 ? -Math.atan2(this.pa[1] - this.pb[1], hl) : 0;
 		car.x = this.pc[0]; car.z = this.pc[2]; car.y = this.pc[1] + this.restY;
+		if (car.pullOverOffset > 0)
+		{
+			car.x += car.hz * car.pullOverOffset;
+			car.z -= car.hx * car.pullOverOffset;
+		}
 		car.pos.set(car.x, car.y, car.z);
 		car.quat.setFromAxisAngle(this.yAxis, car.yaw);
 		this.tq.setFromAxisAngle(this.xAxis, car.pitch);
@@ -1062,7 +1087,7 @@ export class RealismTraffic
 			color: Math.random() < this.settings.variety ? TAXI : Math.floor(Math.random() * TAXI) % TAXI,
 			mode: M_DRIVE, modeT: 0, panicT: 0, stopDone: -1, go: -1, stopT: 0, waitT: 0, honkT: 0, driver: true,
 			x: 0, y: 0, z: 0, yaw: 0, pitch: 0, hx: 0, hz: 1, quat: new THREE.Quaternion(), pos: new THREE.Vector3(), body: null, blockedByPlayer: false,
-			prevV: L.limit * 0.6, brakeT: 0, sig: 0,
+			prevV: L.limit * 0.6, brakeT: 0, sig: 0, pullOverS: -1, pullOverOffset: 0,
 		};
 		car.next = this.pickNext(lane);
 		this.pose(car, 0);
@@ -1091,6 +1116,35 @@ export class RealismTraffic
 
 	public getDensity(): number { return this.slider; }
 
+	/** Signal the nearest traffic car ahead of a patrol vehicle to pull over gradually. */
+	public requestPullOverNear(position: THREE.Vector3, forward: THREE.Vector3, range: number = 80): number
+	{
+		if (!this.ready || !position || !forward || !this.cars.length) return 0;
+		const direction = forward.clone();
+		direction.y = 0;
+		if (direction.lengthSq() < 0.01) return 0;
+		direction.normalize();
+		let best: TCar = null;
+		let bestDistance = range;
+		for (let i = 0; i < this.cars.length; i++)
+		{
+			const car = this.cars[i];
+			if (!car.driver || car.mode !== M_DRIVE || car.pullOverS >= 0) continue;
+			const lane = this.lanes[car.lane];
+			if (lane.conn || lane.len - car.s < 30) continue;
+			const dx = car.x - position.x, dz = car.z - position.z;
+			const distance = Math.sqrt(dx * dx + dz * dz);
+			const lateral = dx * direction.z - dz * direction.x;
+			if (distance >= bestDistance || Math.abs(lateral) > 10 || dx * direction.x + dz * direction.z < 0.55 * distance) continue;
+			best = car;
+			bestDistance = distance;
+		}
+		if (!best) return 0;
+		best.pullOverS = Math.min(this.lanes[best.lane].len - this.carLen, best.s + Math.max(14, Math.min(26, best.v * 2.4)));
+		best.sig = 1;
+		return best.id;
+	}
+
 	// -----------------------------------------------------------------------
 	// drawing + colliders
 	// -----------------------------------------------------------------------
@@ -1105,6 +1159,7 @@ export class RealismTraffic
 		car.brakeT = braking ? 0.4 : Math.max(0, car.brakeT - dt);
 		car.sig = 0;
 		if (!driving) return;
+		if (car.pullOverS >= 0) { car.sig = 1; return; }
 		const L = this.lanes[car.lane];
 		if (L.conn) { if (car.s < L.len * 0.85) car.sig = L.turn; }
 		else if (car.next >= 0)
@@ -1455,7 +1510,7 @@ export class RealismTraffic
 		return this.cars.map((c) =>
 		{
 			const L = this.lanes[c.lane];
-			return { id: c.id, x: c.x, y: c.y, z: c.z, v: c.v, lane: c.lane, s: c.s, conn: L.conn, laneLen: L.len, node: L.node, signal: L.signal, stop: L.stop,
+			return { id: c.id, x: c.x, y: c.y, z: c.z, hx: c.hx, hz: c.hz, v: c.v, lane: c.lane, s: c.s, conn: L.conn, laneLen: L.len, node: L.node, signal: L.signal, stop: L.stop,
 				light: this.lightAt(L), mode: c.mode, next: c.next, driver: c.driver, color: c.color };
 		});
 	}

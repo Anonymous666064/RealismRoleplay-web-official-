@@ -2,1431 +2,1381 @@
  * realism-multiplayer.js  -  Online multiplayer + server browser + character creation
  *  for Realism Roleplay.
  * ============================================================================
- *  Runtime framework. Loaded by index.html AFTER build/sketchbook.min.js.
- *  No webpack rebuild required — same pattern as realism-config.js.
+ *  Built following the proven "Supabase 3D Arena" template patterns:
+ *    - createClient(url, key) — no extra realtime config
+ *    - channel config: presence.key + broadcast.self=false
+ *    - avatars created FROM broadcast data (flat scalars, never origin)
+ *    - broadcast on movement (20 Hz max) + initial burst + re-broadcast on peer join
  *
  *  Requires:
- *    - window.SUPABASE_CONFIG          (supabase-config.js)
- *    - window.supabase                 (CDN: @supabase/supabase-js@2)
- *    - window.THREE                    (bundled with the game)
- *    - window.realismWorld             (set by index.html)
+ *    - window.SUPABASE_CONFIG   (supabase-config.js)
+ *    - window.supabase          (CDN: unpkg @supabase/supabase-js@2)
+ *    - window.THREE             (bundled with the game)
+ *    - window.realismWorld      (set by index.html)
  *
- *  Exposes window.RRMP. See ARCHITECTURE.md for the full design.
- *
- *  MIT-style — part of Realism Roleplay by Riley Freeman / Tha Trenches RP.
+ *  Console: RRMP.debug()
  */
 (function ()
 {
-        'use strict';
+	'use strict';
 
-        if (window.RRMP) return;   // double-load guard
+	if (window.RRMP) return;
 
-        // ======================================================================
-        //  Small utils
-        // ======================================================================
-        const $ = (sel, root) => (root || document).querySelector(sel);
-        const el = (tag, cls, html) =>
-        {
-                const e = document.createElement(tag);
-                if (cls) e.className = cls;
-                if (html != null) e.innerHTML = html;
-                return e;
-        };
-        const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-        const lerp = (a, b, t) => a + (b - a) * t;
-        const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
-        const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#39;' }[c]));
-        const uuid = () =>
-        {
-                if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
-                return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) =>
-                {
-                        const r = Math.random() * 16 | 0; const v = c === 'x' ? r : (r & 0x3 | 0x8);
-                        return v.toString(16);
-                });
-        };
-        const log = (...a) => { if (RRMP.config && RRMP.config.verbose) console.log('[RRMP]', ...a); };
-        const warn = (...a) => console.warn('[RRMP]', ...a);
+	const $ = (sel, root) => (root || document).querySelector(sel);
+	const el = (tag, cls, html) =>
+	{
+		const e = document.createElement(tag);
+		if (cls) e.className = cls;
+		if (html != null) e.innerHTML = html;
+		return e;
+	};
+	const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+	const lerp = (a, b, t) => a + (b - a) * t;
+	const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#39;' }[c]));
+	const log = (...a) => console.log('[RRMP]', ...a);
+	const warn = (...a) => console.warn('[RRMP]', ...a);
 
-        // Detect the role/kind of a Supabase API key. Works with BOTH the legacy
-        // JWT keys (anon / service_role) and the new-format keys (sb_publishable_ /
-        // sb_secret_). Supabase is migrating to the new format; legacy retires 2027.
-        // Returns one of: 'anon' | 'service_role' | 'publishable' | 'secret' | null
-        function keyRole(key)
-        {
-                const k = String(key || '');
-                // New format: prefix-based
-                if (k.indexOf('sb_publishable_') === 0) return 'publishable';
-                if (k.indexOf('sb_secret_') === 0) return 'secret';
-                // Legacy format: decode JWT, read role claim
-                try
-                {
-                        const parts = k.split('.');
-                        if (parts.length < 2) return null;
-                        let b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-                        while (b.length % 4) b += '=';
-                        const json = decodeURIComponent(escape(atob(b)));
-                        const payload = JSON.parse(json);
-                        return payload && payload.role ? String(payload.role) : null;
-                } catch (e) { return null; }
-        }
-        // Back-compat alias
-        const jwtRole = keyRole;
+	const RRMP = window.RRMP = {
+		config: { sendRateHz: 20, heartbeatSeconds: 5, browserRefreshSeconds: 5, maxAvatars: 32 },
+		supabase: null,
+		world: null,
+		disabled: false,
+		disabledReason: null,
+		stats: { channelStatus: null, presenceCount: 0, sent: 0, recv: 0 },
+		combat: { health: 100, kills: 0, deaths: 0 },
+	};
+	const POLICE_RADIO_CHANNELS = ['County Dispatch', 'Police 1', 'Sheriff 1', 'County Tactical', 'Countywide'];
+	const policeRadioListeners = [];
 
-        const RRMP = window.RRMP = {
-                config: { verbose: false, sendRateHz: 20, heartbeatSeconds: 5, browserRefreshSeconds: 5, maxAvatars: 32 },
-                supabase: null,
-                world: null,
-                ready: false,
-                disabled: false,
-                disabledReason: null,
-                // Public: call RRMP.diagnose() from the console to print a full
-                // config + connection diagnostic.
-                diagnose: null,
-        };
+	// ======================================================================
+	//  Identity — persistent character (localStorage) + fresh connId per load
+	//  (Template pattern: fresh UUID per page load so tabs never collide.)
+	// ======================================================================
+	const connId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) =>
+	{
+		const r = Math.random() * 16 | 0;
+		return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+	});
+	const identity = RRMP.identity = {
+		connId: connId,
+		name: 'Player_' + connId.slice(0, 4),
+		skinColor: '#c68642',
+		gender: 'male',
+		load()
+		{
+			try
+			{
+				const c = JSON.parse(localStorage.getItem('rrmp_character') || '{}');
+				if (c.name) this.name = String(c.name).slice(0, 16);
+				if (c.skinColor) this.skinColor = String(c.skinColor);
+				if (c.gender === 'female' || c.gender === 'male') this.gender = c.gender;
+			} catch (e) { /* ignore */ }
+		},
+		save(name, skin, gender)
+		{
+			this.name = String(name || 'Player').trim().slice(0, 16) || 'Player';
+			this.skinColor = skin || '#c68642';
+			this.gender = gender === 'female' ? 'female' : 'male';
+			localStorage.setItem('rrmp_character', JSON.stringify({ name: this.name, skinColor: this.skinColor, gender: this.gender }));
+			const world = RRMP.world;
+			if (world && typeof world.realismSetPlayerGender === 'function') world.realismSetPlayerGender(this.gender);
+		},
+	};
 
-        // ======================================================================
-        //  Config + Supabase client
-        // ======================================================================
-        function initConfig()
-        {
-                const cfg = window.SUPABASE_CONFIG || {};
-                if (!cfg.url || !cfg.anonKey ||
-                        cfg.url.indexOf('YOUR-PROJECT') >= 0 ||
-                        cfg.anonKey.indexOf('YOUR-ANON') >= 0 ||
-                        cfg.anonKey.indexOf('YOUR-PUBLISHABLE') >= 0)
-                {
-                        warn('Supabase not configured. Fill in supabase-config.js (url + anonKey) to enable multiplayer.');
-                        RRMP.disabled = true;
-                        RRMP.disabledReason = 'not configured (open supabase-config.js)';
-                        return false;
-                }
-                // Guard: catch the most common mistake — pasting a server-side secret key
-                // instead of a browser-safe public key. Supabase blocks these in the browser
-                // with "Forbidden use of secret API key in browser". We surface a clearer
-                // message up front. Handles BOTH the legacy and new key formats:
-                //   legacy:  service_role  (JWT)   ← blocked
-                //   new:     sb_secret_…           ← blocked
-                //   legacy:  anon          (JWT)   ← OK
-                //   new:     sb_publishable_…      ← OK (the new anon equivalent)
-                const role = keyRole(cfg.anonKey);
-                if (role === 'service_role' || role === 'secret')
-                {
-                        console.error('[RRMP] You pasted a Supabase SECRET key into supabase-config.js → anonKey. ' +
-                                'That key must NEVER be in a browser — it bypasses RLS and Supabase blocks it. ' +
-                                'Open Supabase → Project Settings → API Keys and copy the PUBLISHABLE key ' +
-                                '(sb_publishable_…) — that is the browser-safe one. (Legacy equivalent: the "anon" JWT.) ' +
-                                'Paste it into supabase-config.js → anonKey, save, and hard refresh.');
-                        RRMP.disabled = true;
-                        RRMP.disabledReason = 'wrong key (' + role + ' in browser — use publishable/anon instead)';
-                        return false;
-                }
-                if (role && role !== 'anon' && role !== 'publishable')
-                {
-                        warn('Unexpected Supabase key role "' + role + '". Expected "anon" or "publishable". Multiplayer disabled.');
-                        RRMP.disabled = true;
-                        RRMP.disabledReason = 'unexpected key role: ' + role;
-                        return false;
-                }
-                const mp = cfg.multiplayer || {};
-                RRMP.config.verbose = !!mp.verbose;
-                RRMP.config.sendRateHz = clamp(mp.sendRateHz || 20, 1, 60);
-                RRMP.config.heartbeatSeconds = clamp(mp.heartbeatSeconds || 5, 2, 25);
-                RRMP.config.browserRefreshSeconds = clamp(mp.browserRefreshSeconds || 5, 2, 60);
-                RRMP.config.maxAvatars = clamp(mp.maxAvatars || 32, 1, 128);
-                if (!window.supabase || typeof window.supabase.createClient !== 'function')
-                {
-                        warn('Supabase JS client not found. Did index.html load the @supabase/supabase-js CDN?');
-                        RRMP.disabled = true;
-                        return false;
-                }
-                RRMP.supabase = window.supabase.createClient(cfg.url, cfg.anonKey, {
-                        realtime: { params: { eventsPerSecond: 50 } },
-                });
-                log('Supabase client ready');
-                return true;
-        }
+	// ======================================================================
+	//  Config init
+	// ======================================================================
+	function initConfig()
+	{
+		const cfg = window.SUPABASE_CONFIG || {};
+		if (!cfg.url || !cfg.anonKey ||
+			cfg.url.indexOf('YOUR-PROJECT') >= 0 ||
+			cfg.anonKey.indexOf('YOUR-') >= 0)
+		{
+			warn('Supabase not configured — fill in supabase-config.js.');
+			RRMP.disabled = true;
+			RRMP.disabledReason = 'not configured';
+			return false;
+		}
+		if (!window.supabase || typeof window.supabase.createClient !== 'function')
+		{
+			warn('supabase-js not loaded. Did index.html load the CDN?');
+			RRMP.disabled = true;
+			RRMP.disabledReason = 'supabase-js not loaded';
+			return false;
+		}
+		// EXACTLY like the template: no extra realtime config.
+		RRMP.supabase = window.supabase.createClient(cfg.url, cfg.anonKey);
+		const mp = cfg.multiplayer || {};
+		RRMP.config.sendRateHz = clamp(mp.sendRateHz || 20, 1, 60);
+		RRMP.config.heartbeatSeconds = clamp(mp.heartbeatSeconds || 5, 2, 25);
+		RRMP.config.browserRefreshSeconds = clamp(mp.browserRefreshSeconds || 5, 2, 60);
+		RRMP.config.maxAvatars = clamp(mp.maxAvatars || 32, 1, 128);
+		log('Supabase client ready');
+		return true;
+	}
 
-        // Public diagnostic. Call RRMP.diagnose() from the console to print a full
-        // config + connection check. Returns the same info as an object too.
-        function diagnose()
-        {
-                const cfg = window.SUPABASE_CONFIG || {};
-                const out = { url: cfg.url, anonKey: null, keyRef: null, urlRef: null, role: null, match: null, rrmpLoaded: true, disabled: RRMP.disabled, disabledReason: RRMP.disabledReason, sbClientLoaded: !!(window.supabase && typeof window.supabase.createClient === 'function'), expires: null, issued: null, keyFormat: null };
-                console.group('%c[RRMP] Diagnostic', 'color:#ffd27a;font-weight:bold');
-                console.log('URL:', out.url);
-                if (!cfg.anonKey) { console.log('Anon key: MISSING'); console.groupEnd(); return out; }
-                out.anonKey = cfg.anonKey.substring(0, 28) + '… (' + cfg.anonKey.length + ' chars)';
-                console.log('Anon key:', out.anonKey);
-                const role = keyRole(cfg.anonKey);
-                out.role = role;
-                // Detect key format (new sb_* vs legacy JWT)
-                out.keyFormat = (cfg.anonKey.indexOf('sb_publishable_') === 0) ? 'new (publishable)' :
-                        (cfg.anonKey.indexOf('sb_secret_') === 0) ? 'new (secret)' :
-                        (cfg.anonKey.split('.').length >= 3) ? 'legacy (JWT)' : 'unknown';
-                console.log('Key format:', out.keyFormat);
-                console.log('Key role:', role || 'could not decode');
-                // Decode the JWT payload (legacy keys only) to get ref / iat / exp
-                if (out.keyFormat === 'legacy (JWT)')
-                {
-                        try
-                        {
-                                const parts = String(cfg.anonKey).split('.');
-                                if (parts.length >= 2)
-                                {
-                                        let b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-                                        while (b.length % 4) b += '=';
-                                        const payload = JSON.parse(decodeURIComponent(escape(atob(b))));
-                                        out.keyRef = payload.ref || null;
-                                        out.issued = payload.iat ? new Date(payload.iat * 1000).toISOString() : null;
-                                        out.expires = payload.exp ? new Date(payload.exp * 1000).toISOString() : null;
-                                        console.log('Key project ref:', out.keyRef);
-                                        console.log('Key issued:', out.issued);
-                                        console.log('Key expires:', out.expires);
-                                }
-                        } catch (e) { console.log('JWT decode failed:', e.message); }
-                }
-                const m = cfg.url && cfg.url.match(/https?:\/\/([^.]+)\.supabase\.co/);
-                out.urlRef = m ? m[1] : null;
-                console.log('URL project ref:', out.urlRef);
-                if (out.keyRef && out.urlRef)
-                {
-                        out.match = out.keyRef === out.urlRef;
-                        console.log('%cKey matches URL? ' + (out.match ? 'YES ✓' : 'NO ✗ — key is from a different Supabase project'), out.match ? 'color:#46d27a' : 'color:#ff9a9a;font-weight:bold');
-                }
-                console.log('RRMP loaded:', out.rrmpLoaded, '| disabled:', out.disabled, out.disabledReason ? '| reason: ' + out.disabledReason : '');
-                console.log('supabase-js loaded:', out.sbClientLoaded);
-                // Friendly verdict
-                if (role === 'service_role' || role === 'secret')
-                        console.log('%c→ You pasted a SECRET key (sb_secret_ or service_role). NEVER put that in a browser. Copy the PUBLISHABLE key (sb_publishable_…) instead — or the legacy "anon" JWT.', 'color:#ff9a9a;font-weight:bold');
-                else if (role === 'publishable' || role === 'anon')
-                        console.log('%c→ Key is browser-safe (' + role + '). Config looks correct. If you still get 401s, the key may have been rotated — regenerate it in Supabase → Settings → API Keys.', 'color:#46d27a');
-                else if (out.match === false)
-                        console.log('%c→ URL and key are from different projects. Open the dashboard for project ' + out.urlRef + ' and copy THAT project\'s publishable/anon key.', 'color:#ff9a9a;font-weight:bold');
-                else if (RRMP.disabled)
-                        console.log('%c→ Multiplayer is disabled. See reason above.', 'color:#ff9a9a;font-weight:bold');
-                else
-                        console.log('%c→ Config looks correct. If you still get 401s, the key may have been rotated in the Supabase dashboard.', 'color:#ffd27a');
-                console.groupEnd();
-                return out;
-        }
-        RRMP.diagnose = diagnose;
+	// ======================================================================
+	//  Debug
+	// ======================================================================
+	RRMP.debug = function ()
+	{
+		console.group('%c[RRMP] Debug', 'color:#9fc0ff;font-weight:bold');
+		console.log('connId:', connId);
+		console.log('server:', session.server ? session.server.name : '(not joined)');
+		console.log('channel:', session.channel ? 'exists' : 'null');
+		console.log('status:', RRMP.stats.channelStatus);
+		console.log('presence count:', RRMP.stats.presenceCount);
+		console.log('broadcasts sent:', RRMP.stats.sent, '| received:', RRMP.stats.recv);
+		console.log('remote avatars:', Object.keys(remotePlayers).length);
+		console.log('remote ids:', Object.keys(remotePlayers).map((k) => k.slice(0, 8)));
+		if (session.channel)
+		{
+			try
+			{
+				const st = session.channel.presenceState();
+				console.log('presenceState:', Object.keys(st).length, 'entries');
+			} catch (e) { /* ignore */ }
+		}
+		console.groupEnd();
+		return RRMP.stats;
+	};
 
-        // ======================================================================
-        //  Identity + character (localStorage)
-        // ======================================================================
-        const LS_ID = 'rrmp_player_id';
-        const LS_CHAR = 'rrmp_character';
+	// ======================================================================
+	//  DB helpers (server registry + session rows for player counts)
+	// ======================================================================
+	const db = RRMP.db = {
+		async listServers()
+		{
+			const { data, error } = await RRMP.supabase.rpc('list_servers');
+			if (error) throw error;
+			return data || [];
+		},
+		async getByCode(code)
+		{
+			const { data, error } = await RRMP.supabase.rpc('get_server_by_code', { p_code: code });
+			if (error) throw error;
+			return data && data.length ? data[0] : null;
+		},
+		async createServer(name, isPublic, code, maxPlayers)
+		{
+			const row = {
+				name: String(name).trim().slice(0, 40) || 'New Server',
+				is_public: !!isPublic,
+				join_code: isPublic ? null : (code || genCode()).toUpperCase(),
+				owner_id: null,
+				max_players: clamp(parseInt(maxPlayers, 10) || 16, 1, 64),
+				seed: 1337,
+				is_default: false,
+			};
+			const { data, error } = await RRMP.supabase.from('servers').insert(row).select().single();
+			if (error) throw error;
+			return data;
+		},
+		async joinSession(serverId)
+		{
+			const { error } = await RRMP.supabase.from('server_sessions')
+				.insert({ server_id: serverId, player_id: connId, player_name: identity.name, skin_color: identity.skinColor });
+			if (error) throw error;
+		},
+		async heartbeat(serverId)
+		{
+			await RRMP.supabase.from('server_sessions')
+				.update({ last_seen: new Date().toISOString(), player_name: identity.name, skin_color: identity.skinColor })
+				.eq('player_id', connId).eq('server_id', serverId);
+		},
+		async leaveSession(serverId)
+		{
+			await RRMP.supabase.from('server_sessions').delete()
+				.eq('player_id', connId).eq('server_id', serverId);
+		},
+		async reap()
+		{
+			try { await RRMP.supabase.rpc('reap_stale_sessions'); } catch (e) { /* non-fatal */ }
+		},
+	};
 
-        const identity = RRMP.identity = {
-                id: null,
-                name: 'Player',
-                skinColor: '#c68642',
-                load()
-                {
-                        let id = localStorage.getItem(LS_ID);
-                        if (!id) { id = uuid(); localStorage.setItem(LS_ID, id); }
-                        this.id = id;
-                        try
-                        {
-                                const c = JSON.parse(localStorage.getItem(LS_CHAR) || '{}');
-                                if (c.name) this.name = String(c.name).slice(0, 16);
-                                if (c.skinColor) this.skinColor = String(c.skinColor);
-                        } catch (e) { /* ignore */ }
-                },
-                saveCharacter(name, skinColor)
-                {
-                        this.name = String(name || 'Player').trim().slice(0, 16) || 'Player';
-                        this.skinColor = skinColor || '#c68642';
-                        localStorage.setItem(LS_CHAR, JSON.stringify({ name: this.name, skinColor: this.skinColor }));
-                },
-        };
+	function genCode()
+	{
+		const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+		let s = '';
+		for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
+		return s;
+	}
 
-        // ======================================================================
-        //  DB helpers
-        // ======================================================================
-        const db = RRMP.db = {
-                async listServers()
-                {
-                        const { data, error } = await RRMP.supabase.rpc('list_servers');
-                        if (error) throw error;
-                        return data || [];
-                },
-                async getByCode(code)
-                {
-                        const { data, error } = await RRMP.supabase.rpc('get_server_by_code', { p_code: code });
-                        if (error) throw error;
-                        return data && data.length ? data[0] : null;
-                },
-                async createServer(name, isPublic, code, maxPlayers, seed)
-                {
-                        const row = {
-                                name: String(name).trim().slice(0, 40) || 'New Server',
-                                is_public: !!isPublic,
-                                join_code: isPublic ? null : (code || genCode()).toUpperCase(),
-                                owner_id: identity.id,
-                                max_players: clamp(parseInt(maxPlayers, 10) || 16, 1, 64),
-                                seed: parseInt(seed, 10) || 1337,
-                                is_default: false,
-                        };
-                        const { data, error } = await RRMP.supabase.from('servers').insert(row).select().single();
-                        if (error) throw error;
-                        return data;
-                },
-                async deleteServer(id)
-                {
-                        const { error } = await RRMP.supabase.from('servers').delete().eq('id', id);
-                        if (error) throw error;
-                },
-                // joinSession / heartbeat / leaveSession all key on connId (a fresh UUID
-                // per join, generated by session.join). This lets the same player have
-                // multiple connections (e.g. two tabs for testing) without colliding.
-                async joinSession(server, connId)
-                {
-                        const row = {
-                                id: connId,                          // connection UUID (NOT player_id)
-                                server_id: server.id,
-                                player_id: identity.id,              // persistent player identity
-                                player_name: identity.name,
-                                skin_color: identity.skinColor,
-                                last_seen: new Date().toISOString(),
-                                joined_at: new Date().toISOString(),
-                        };
-                        const { error } = await RRMP.supabase.from('server_sessions').insert(row);
-                        if (error) throw error;
-                },
-                async heartbeat(serverId, connId)
-                {
-                        await RRMP.supabase.from('server_sessions')
-                                .update({ last_seen: new Date().toISOString(), player_name: identity.name, skin_color: identity.skinColor })
-                                .eq('id', connId).eq('server_id', serverId);
-                },
-                async leaveSession(serverId, connId)
-                {
-                        await RRMP.supabase.from('server_sessions').delete()
-                                .eq('id', connId).eq('server_id', serverId);
-                },
-                async reap()
-                {
-                        try { await RRMP.supabase.rpc('reap_stale_sessions'); } catch (e) { /* non-fatal */ }
-                },
-        };
+	// ======================================================================
+	//  Local player helpers
+	// ======================================================================
+	function getLocalPlayer()
+	{
+		const w = RRMP.world;
+		if (!w) return null;
+		const im = w.inputManager;
+		if (im && im.controllingCharacter) return im.controllingCharacter;
+		if (w.characters && w.characters.length) return w.characters[0];
+		return null;
+	}
 
-        function genCode()
-        {
-                const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-                let s = '';
-                for (let i = 0; i < 6; i++) s += chars[Math.floor(Math.random() * chars.length)];
-                return s;
-        }
+	function readLocalTransform()
+	{
+		const ch = getLocalPlayer();
+		if (!ch) return null;
+		let x = 0, y = 0, z = 0, ry = 0;
+		try
+		{
+			const THREE = window.THREE;
+			const p = new THREE.Vector3();
+			const direction = new THREE.Vector3();
+			ch.getWorldPosition(p);
+			ch.getWorldDirection(direction);
+			x = p.x; y = p.y; z = p.z;
+			ry = Math.atan2(direction.x, direction.z);
+		} catch (e) { /* ignore */ }
+		const transform = { x: +x.toFixed(2), y: +y.toFixed(2), z: +z.toFixed(2), ry: +ry.toFixed(3) };
+		const seatBlend = Number(ch.seatBlendOverride);
+		transform.seatBlend = seatBlend >= 0
+			? Math.max(0, Math.min(1, seatBlend))
+			: (ch.occupyingSeat && ch.physicsEnabled === false ? 1 : 0);
+		const seat = ch.occupyingSeat;
+		const vehicle = seat && seat.vehicle;
+		if (vehicle)
+		{
+			const id = vehicleId(vehicle);
+			const body = vehicle.collision;
+			transform.vehicle = {
+				id,
+				driver: vehicle.controllingCharacter === ch,
+				seat: Array.isArray(vehicle.seats) ? vehicle.seats.indexOf(seat) : -1,
+				type: typeof vehicle.realismType === 'string' ? vehicle.realismType :
+					(vehicle.entityType === 1 ? 'airplane' : vehicle.entityType === 3 ? 'heli' : 'car'),
+				x: body.position.x, y: body.position.y, z: body.position.z,
+				qx: body.quaternion.x, qy: body.quaternion.y, qz: body.quaternion.z, qw: body.quaternion.w,
+				vx: body.velocity.x, vy: body.velocity.y, vz: body.velocity.z,
+			};
+		}
+		transform.gender = ch.realismGender === 'female' ? 'female' : identity.gender;
+		transform.modelScale = Number(ch.modelScale) || 1.7;
+		return transform;
+	}
 
-        // ======================================================================
-        //  Local-player helpers (read transform, apply skin)
-        // ======================================================================
-        function getLocalPlayer()
-        {
-                const w = RRMP.world;
-                if (!w) return null;
-                const im = w.inputManager;
-                if (im && im.controllingCharacter) return im.controllingCharacter;
-                if (w.characters && w.characters.length) return w.characters[0];
-                return null;
-        }
+	function vehicleId(vehicle)
+	{
+		const w = RRMP.world;
+		try
+		{
+			const owned = w && w.realismOwnedCars && w.realismOwnedCars.recordFor(vehicle);
+			if (owned && owned.id) return 'owned:' + owned.id;
+		} catch (e) { /* vehicle may not be registered as owned */ }
+		const point = vehicle && vehicle.spawnPoint;
+		if (point)
+		{
+			const THREE = window.THREE;
+			const pos = new THREE.Vector3();
+			point.getWorldPosition(pos);
+			return 'spawn:' + (point.name || 'vehicle') + ':' + [pos.x, pos.y, pos.z].map((v) => Math.round(v * 10) / 10).join(',');
+		}
+		return vehicle && vehicle.name ? 'named:' + vehicle.name : null;
+	}
 
-        function getPlayerObject3D(ch)
-        {
-                if (!ch) return null;
-                return ch.model || ch.threeObject || ch.mesh || (ch.isObject3D ? ch : null);
-        }
+	function setBodyPose(body, pose)
+	{
+		if (!body || !pose) return;
+		body.position.set(pose.x, pose.y, pose.z);
+		body.interpolatedPosition.set(pose.x, pose.y, pose.z);
+		body.previousPosition.set(pose.x, pose.y, pose.z);
+		body.quaternion.set(pose.qx, pose.qy, pose.qz, pose.qw);
+		body.interpolatedQuaternion.set(pose.qx, pose.qy, pose.qz, pose.qw);
+		body.velocity.set(pose.vx || 0, pose.vy || 0, pose.vz || 0);
+		body.aabbNeedsUpdate = true;
+		if (body.wakeUp) body.wakeUp();
+	}
 
-        function readLocalTransform()
-        {
-                const ch = getLocalPlayer();
-                if (!ch) return null;
-                let x = 0, y = 0, z = 0, yaw = 0;
-                try
-                {
-                        const cap = ch.characterCapsule;
-                        if (cap && cap.body && cap.body.position) { x = cap.body.position.x; y = cap.body.position.y; z = cap.body.position.z; }
-                        else if (ch.position) { x = ch.position.x; y = ch.position.y; z = ch.position.z; }
-                } catch (e) { /* ignore */ }
-                try
-                {
-                        const obj = getPlayerObject3D(ch);
-                        if (obj && obj.rotation) yaw = obj.rotation.y;
-                        else if (ch.rotation) yaw = ch.rotation.y;
-                } catch (e) { /* ignore */ }
-                // motion from horizontal velocity
-                let motion = 'idle';
-                try
-                {
-                        const cap = ch.characterCapsule;
-                        if (cap && cap.body && cap.body.velocity)
-                        {
-                                const v = cap.body.velocity;
-                                const sp = Math.sqrt(v.x * v.x + v.z * v.z);
-                                motion = sp < 0.6 ? 'idle' : (sp < 3.2 ? 'walk' : 'run');
-                        }
-                } catch (e) { /* ignore */ }
-                return { t: [+x.toFixed(2), +y.toFixed(2), +z.toFixed(2)], r: +yaw.toFixed(3), m: motion };
-        }
+	function applySkinColor(color)
+	{
+		const ch = getLocalPlayer();
+		if (!ch) return;
+		const obj = ch.model || ch.threeObject || ch.mesh || (ch.isObject3D ? ch : null);
+		if (!obj) return;
+		obj.traverse((node) =>
+		{
+			if (!node.isMesh || !node.material) return;
+			if (!node.__rrmpOwned)
+			{
+				node.__rrmpOwned = true;
+				node.material = Array.isArray(node.material) ? node.material.map((m) => m.clone()) : node.material.clone();
+			}
+			(Array.isArray(node.material) ? node.material : [node.material]).forEach((m) => { if (m && m.color) try { m.color.set(color); } catch (e) { /* ignore */ } });
+		});
+		ch.__rrmpSkin = color;
+	}
 
-        // Apply skin color to the local player's meshes (clone materials so NPCs are unaffected).
-        function applySkinColor(color)
-        {
-                const ch = getLocalPlayer();
-                if (!ch) return false;
-                const obj = getPlayerObject3D(ch);
-                if (!obj) return false;
-                let touched = 0;
-                obj.traverse((node) =>
-                {
-                        if (!node.isMesh || !node.material) return;
-                        // clone once per mesh on first touch so we never mutate shared materials (NPCs stay unaffected)
-                        if (!node.__rrmpOwned)
-                        {
-                                node.__rrmpOwned = true;
-                                if (Array.isArray(node.material)) node.material = node.material.map((mm) => mm.clone());
-                                else node.material = node.material.clone();
-                        }
-                        const cur = Array.isArray(node.material) ? node.material : [node.material];
-                        cur.forEach((m) =>
-                        {
-                                if (m && m.color) { try { m.color.set(color); touched++; } catch (e) { /* ignore */ } }
-                        });
-                });
-                ch.__rrmpSkin = color;
-                log('skin applied', color, 'meshes:', touched);
-                return touched > 0;
-        }
+	let _lastPlayerRef = null;
+	function maintainSkin()
+	{
+		const ch = getLocalPlayer();
+		if (!ch) { _lastPlayerRef = null; return; }
+		if (ch === _lastPlayerRef && ch.__rrmpSkin === identity.skinColor) return;
+		_lastPlayerRef = ch;
+		applySkinColor(identity.skinColor);
+	}
 
-        // Re-apply skin whenever the local player object changes (e.g. after respawn).
-        let _lastPlayerRef = null;
-        let _lastSkinApplied = null;
-        function maintainSkin()
-        {
-                const ch = getLocalPlayer();
-                if (!ch) { _lastPlayerRef = null; return; }
-                if (ch === _lastPlayerRef && ch.__rrmpSkin === identity.skinColor) return;
-                _lastPlayerRef = ch;
-                applySkinColor(identity.skinColor);
-                _lastSkinApplied = identity.skinColor;
-        }
+	// ======================================================================
+	//  Remote players — created FROM broadcast data (template pattern)
+	// ======================================================================
+	function makeTextSprite(text)
+	{
+		const THREE = window.THREE;
+		const c = document.createElement('canvas');
+		c.width = 256; c.height = 64;
+		const g = c.getContext('2d');
+		g.font = 'bold 30px Solway, Arial, sans-serif';
+		g.strokeStyle = 'rgba(0,0,0,0.85)'; g.lineWidth = 5;
+		g.textAlign = 'center'; g.textBaseline = 'middle';
+		g.strokeText(text, 128, 32);
+		g.fillStyle = '#fff';
+		g.fillText(text, 128, 32);
+		const tex = new THREE.CanvasTexture(c);
+		const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+		const s = new THREE.Sprite(mat);
+		s.scale.set(1.4, 0.35, 1);
+		return s;
+	}
 
-        // ======================================================================
-        //  Remote avatars
-        // ======================================================================
-        const avatars = RRMP.avatars = {
-                map: new Map(),   // playerId -> { group, head, body, label, target:{x,y,z,yaw,motion}, last, phase }
-                scene: null,
-                ensureScene()
-                {
-                        if (this.scene) return this.scene;
-                        const w = RRMP.world;
-                        if (w && w.graphicsWorld) this.scene = w.graphicsWorld;
-                        return this.scene;
-                },
-                spawn(playerId, info)
-                {
-                        if (this.map.has(playerId)) { this.updateInfo(playerId, info); return; }
-                        if (this.map.size >= RRMP.config.maxAvatars) { log('avatar cap reached, skipping', playerId); return; }
-                        const THREE = window.THREE;
-                        if (!THREE || !this.ensureScene()) { log('no THREE/scene for avatar'); return; }
-                        const skin = (info && info.skinColor) || '#c68642';
-                        const group = new THREE.Group();
+	const remotePlayers = RRMP.remotePlayers = Object.create(null);
+	const remoteVehicles = RRMP.remoteVehicles = Object.create(null);
+	const remoteVehicleTargets = Object.create(null);
 
-                        const bodyMat = new THREE.MeshLambertMaterial({ color: skin });
-                        const headMat = new THREE.MeshLambertMaterial({ color: lighten(skin, 1.12) });
-                        const body = new THREE.Mesh(new THREE.CapsuleGeometry ? new THREE.CapsuleGeometry(0.28, 0.7, 4, 8) : new THREE.CylinderGeometry(0.28, 0.28, 1.0, 8), bodyMat);
-                        body.position.y = 0.7;
-                        const head = new THREE.Mesh(new THREE.SphereGeometry(0.22, 12, 10), headMat);
-                        head.position.y = 1.45;
-                        group.add(body); group.add(head);
+	function normalizeGender(value)
+	{
+		return value === 'female' ? 'female' : 'male';
+	}
 
-                        const label = makeLabel((info && info.name) || 'Player');
-                        label.position.y = 1.95;
-                        group.add(label);
+	function cloneModelMaterials(model)
+	{
+		model.traverse((node) =>
+		{
+			if (!node.isMesh || !node.material) return;
+			node.frustumCulled = false;
+			node.material = Array.isArray(node.material) ? node.material.map((material) => material.clone()) : node.material.clone();
+		});
+	}
 
-                        this.scene.add(group);
-                        this.map.set(playerId, {
-                                group, body, head, label,
-                                target: { x: 0, y: 0, z: 0, yaw: 0, motion: 'idle' },
-                                last: 0, phase: Math.random() * Math.PI * 2,
-                                skin,
-                        });
-                        log('avatar spawn', playerId, info);
-                },
-                updateInfo(playerId, info)
-                {
-                        const a = this.map.get(playerId);
-                        if (!a) return;
-                        if (info && info.skinColor && info.skinColor !== a.skin)
-                        {
-                                a.skin = info.skinColor;
-                                if (a.body.material) a.body.material.color.set(info.skinColor);
-                                if (a.head.material) a.head.material.color.set(lighten(info.skinColor, 1.12));
-                        }
-                        if (info && info.name) updateLabel(a.label, info.name);
-                },
-                setTarget(playerId, t)
-                {
-                        const a = this.map.get(playerId);
-                        if (!a) return;
-                        a.target.x = t.t[0]; a.target.y = t.t[1]; a.target.z = t.t[2];
-                        a.target.yaw = t.r; a.target.motion = t.m || 'idle'; a.last = now();
-                },
-                remove(playerId)
-                {
-                        const a = this.map.get(playerId);
-                        if (!a) return;
-                        if (a.group && a.group.parent) a.group.parent.remove(a.group);
-                        disposeGroup(a.group);
-                        this.map.delete(playerId);
-                        log('avatar remove', playerId);
-                },
-                clear()
-                {
-                        this.map.forEach((_, id) => this.remove(id));
-                },
-                // per-frame lerp + motion bob
-                tick(dt)
-                {
-                        const t = now();
-                        this.map.forEach((a) =>
-                        {
-                                const g = a.group;
-                                // teleport if very far (spawn / server change), else lerp
-                                const dx = a.target.x - g.position.x;
-                                const dz = a.target.z - g.position.z;
-                                const dist = Math.sqrt(dx * dx + dz * dz);
-                                if (dist > 40) { g.position.set(a.target.x, a.target.y, a.target.z); }
-                                else
-                                {
-                                        const k = 1 - Math.pow(0.001, dt);   // frame-rate independent lerp
-                                        g.position.x = lerp(g.position.x, a.target.x, k);
-                                        g.position.y = lerp(g.position.y, a.target.y, k);
-                                        g.position.z = lerp(g.position.z, a.target.z, k);
-                                }
-                                // yaw (shortest arc)
-                                let dyaw = a.target.yaw - g.rotation.y;
-                                while (dyaw > Math.PI) dyaw -= Math.PI * 2;
-                                while (dyaw < -Math.PI) dyaw += Math.PI * 2;
-                                g.rotation.y = g.rotation.y + dyaw * (1 - Math.pow(0.001, dt));
-                                // motion bob
-                                if (a.target.motion !== 'idle')
-                                {
-                                        a.phase += dt * (a.target.motion === 'run' ? 12 : 7);
-                                        a.body.position.y = 0.7 + Math.sin(a.phase) * 0.04;
-                                }
-                                else { a.body.position.y = 0.7; }
-                                // hide label if stale (no updates in 4s)
-                                if (a.label) a.label.visible = (t - a.last) < 4000 || a.last === 0;
-                        });
-                },
-        };
+	function applyRemoteSkin(rp)
+	{
+		if (!rp.model) return;
+		rp.model.traverse((node) =>
+		{
+			if (!node.isMesh || !node.material) return;
+			(Array.isArray(node.material) ? node.material : [node.material]).forEach((material) =>
+			{
+				if (material && material.color) material.color.set(rp.skin);
+			});
+		});
+	}
 
-        function lighten(hex, factor)
-        {
-                try
-                {
-                        const c = hex.replace('#', '');
-                        const r = clamp(Math.round(parseInt(c.substring(0, 2), 16) * factor), 0, 255);
-                        const g = clamp(Math.round(parseInt(c.substring(2, 4), 16) * factor), 0, 255);
-                        const b = clamp(Math.round(parseInt(c.substring(4, 6), 16) * factor), 0, 255);
-                        return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('');
-                } catch (e) { return hex; }
-        }
+	function fitRemoteModel(rp)
+	{
+		if (!rp.model || !rp.modelHeight) return;
+		const settingsByGender = RRMP.world && RRMP.world.realismPlayerModelSettings || {};
+		const settings = settingsByGender[rp.gender] || {};
+		const height = Number(settings.height) > 0 ? Number(settings.height) : 1.7;
+		const modelScale = Number(settings.scale) > 0 ? clamp(Number(settings.scale), 0.01, 5) : 1;
+		const seatedScale = Number(settings.seatedScale) > 0 ? clamp(Number(settings.seatedScale), 0.01, 5) : 0.72;
+		const blend = clamp(Number(rp.seatBlend) || 0, 0, 1);
+		const scale = (height / rp.modelHeight) * modelScale * (1 + (seatedScale - 1) * blend);
+		const y = Number.isFinite(Number(settings.y)) ? Number(settings.y) : 0;
+		const seatedY = Number.isFinite(Number(settings.seatedY)) ? Number(settings.seatedY) : 0;
+		const yOffset = y + (seatedY - y) * blend;
+		rp.model.scale.setScalar(scale);
+		rp.model.position.y = -0.57 * rp.modelScale - rp.modelMinY * scale + yOffset;
+		rp.label.position.y = height * modelScale * (1 + (seatedScale - 1) * blend) - 0.57 * rp.modelScale + yOffset + 0.1;
+	}
 
-        function makeLabel(text)
-        {
-                const THREE = window.THREE;
-                const canvas = document.createElement('canvas');
-                canvas.width = 256; canvas.height = 64;
-                const ctx = canvas.getContext('2d');
-                drawLabel(ctx, text);
-                const tex = new THREE.CanvasTexture(canvas);
-                tex.minFilter = THREE.LinearFilter;
-                const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
-                const spr = new THREE.Sprite(mat);
-                spr.scale.set(1.2, 0.3, 1);
-                spr.userData.canvas = canvas;
-                spr.userData.ctx = ctx;
-                spr.userData.tex = tex;
-                return spr;
-        }
-        function drawLabel(ctx, text)
-        {
-                ctx.clearRect(0, 0, 256, 64);
-                ctx.font = 'bold 30px Solway, Arial, sans-serif';
-                ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-                ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(0,0,0,0.85)';
-                ctx.strokeText(text, 128, 32);
-                ctx.fillStyle = '#ffffff';
-                ctx.fillText(text, 128, 32);
-        }
-        function updateLabel(spr, text)
-        {
-                if (!spr || !spr.userData || !spr.userData.ctx) return;
-                drawLabel(spr.userData.ctx, text);
-                spr.userData.tex.needsUpdate = true;
-        }
-        function disposeGroup(g)
-        {
-                if (!g) return;
-                g.traverse((n) =>
-                {
-                        if (n.geometry) try { n.geometry.dispose(); } catch (e) { /* ignore */ }
-                        if (n.material)
-                        {
-                                const mats = Array.isArray(n.material) ? n.material : [n.material];
-                                mats.forEach((m) =>
-                                {
-                                        if (m && m.map) try { m.map.dispose(); } catch (e) { /* ignore */ }
-                                        if (m) try { m.dispose(); } catch (e) { /* ignore */ }
-                                });
-                        }
-                });
-        }
+	function setRemoteAnimation(rp, state)
+	{
+		if (!rp.mixer || rp.animationState === state) return;
+		const preferred = state === 'idle' ? ['idle', 'walk', 'run'] : state === 'run' ? ['run', 'walk'] : ['walk', 'run'];
+		let clip = null;
+		for (let i = 0; i < preferred.length && !clip; i++)
+		{
+			clip = (rp.animations || []).find((item) => item && String(item.name).toLowerCase() === preferred[i]);
+		}
+		if (!clip) return;
+		const isFrozenIdle = state === 'idle' && String(clip.name).toLowerCase() !== 'idle';
+		const action = rp.mixer.clipAction(clip);
+		rp.mixer.stopAllAction();
+		action.reset();
+		action.fadeIn(0.15);
+		action.play();
+		action.setEffectiveTimeScale(isFrozenIdle ? 0 : 1);
+		rp.animationState = state;
+	}
 
-        // ======================================================================
-        //  P2P (WebRTC) — used for LAN mode. Direct peer-to-peer data channels.
-        //  Supabase Realtime is used ONLY for signaling (exchanging SDP offer /
-        //  answer / ICE candidates). Once the data channel is open, position
-        //  updates flow directly between browsers — on a LAN this means local
-        //  network speeds, no internet roundtrip.
-        // ======================================================================
-        const ICE_CONFIG = {
-                iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:stun1.l.google.com:19302' },
-                ],
-        };
+	function loadRemotePlayerModel(id, rp, gender)
+	{
+		const world = RRMP.world;
+		if (!world || typeof world.realismLoadPlayerModel !== 'function')
+		{
+			warn('remote player model loader is unavailable');
+			return;
+		}
+		const token = rp.modelRequest = (rp.modelRequest || 0) + 1;
+		rp.modelLoading = gender;
+		world.realismLoadPlayerModel(gender, (asset) =>
+		{
+			if (remotePlayers[id] !== rp || rp.modelRequest !== token || rp.gender !== gender) return;
+			const model = asset.scene;
+			cloneModelMaterials(model);
+			model.updateMatrixWorld(true);
+			const bounds = new window.THREE.Box3().setFromObject(model);
+			const height = bounds.max.y - bounds.min.y;
+			if (!Number.isFinite(height) || height <= 0)
+			{
+				warn('remote player model has invalid bounds:', gender);
+				return;
+			}
+			if (rp.mixer) rp.mixer.stopAllAction();
+			if (rp.model)
+			{
+				rp.group.remove(rp.model);
+				disposeRemoteGroup(rp.model);
+			}
+			const visual = new window.THREE.Group();
+			visual.add(model);
+			rp.model = visual;
+			rp.modelHeight = height;
+			rp.modelMinY = bounds.min.y;
+			rp.animations = asset.animations || [];
+			rp.mixer = new window.THREE.AnimationMixer(model);
+			rp.animationState = null;
+			rp.modelLoading = null;
+			rp.group.add(visual);
+			fitRemoteModel(rp);
+			applyRemoteSkin(rp);
+			setRemoteAnimation(rp, 'idle');
+		}, () => warn('could not load remote player model:', gender));
+	}
 
-        const p2p = RRMP.p2p = {
-                connections: new Map(),   // remoteConnId -> { pc, dc, state }
-                enabled: false,           // set true when LAN mode is chosen
+	function createRemotePlayer(data)
+	{
+		const THREE = window.THREE;
+		const w = RRMP.world;
+		if (!THREE || !w || !w.graphicsWorld) { warn('createRemotePlayer: no THREE/scene'); return; }
+		const group = new THREE.Group();
+		const label = makeTextSprite(data.name || 'Player');
+		group.add(label);
+		// Position comes FROM the broadcast data — never origin.
+		group.position.set(Number(data.x) || 0, Number(data.y) || 0, Number(data.z) || 0);
+		w.graphicsWorld.add(group);
+		const rp = remotePlayers[data.id] = {
+			group, label, name: data.name || 'Player', skin: data.skin || '#c68642',
+			gender: normalizeGender(data.gender), modelScale: clamp(Number(data.modelScale) || 1.7, 0.3, 3),
+			seatBlend: clamp(Number(data.seatBlend) || 0, 0, 1),
+			tx: Number(data.x) || 0, ty: Number(data.y) || 0, tz: Number(data.z) || 0,
+			tryaw: Number(data.ry) || 0, model: null, modelHeight: 0, modelMinY: 0,
+			mixer: null, animations: [], animationState: null, modelRequest: 0, modelLoading: null,
+		};
+		loadRemotePlayerModel(data.id, rp, rp.gender);
+		log('remote player created:', (data.id || '').slice(0, 8), data.name, 'at', (data.x || 0).toFixed(1), (data.y || 0).toFixed(1), (data.z || 0).toFixed(1));
+	}
 
-                // Called when a new peer appears in Presence. The side with the
-                // "smaller" connId initiates the offer — avoids both sides offering.
-                onPeerSeen(remoteConnId)
-                {
-                        if (!this.enabled || !session.connId) return;
-                        if (this.connections.has(remoteConnId)) return;
-                        if (session.connId < remoteConnId) this.createOffer(remoteConnId);
-                },
+	function updateRemotePlayer(data)
+	{
+		if (!data || typeof data.id !== 'string' || data.id === connId ||
+			![data.x, data.y, data.z].every((v) => Number.isFinite(Number(v)))) return;
+		data = Object.assign({}, data, { x: Number(data.x), y: Number(data.y), z: Number(data.z), ry: Number(data.ry) || 0 });
+		if (!remotePlayers[data.id]) createRemotePlayer(data);
+		const rp = remotePlayers[data.id];
+		if (!rp) return;
+		rp.tx = Number(data.x) || 0; rp.ty = Number(data.y) || 0; rp.tz = Number(data.z) || 0; rp.tryaw = Number(data.ry) || 0;
+		if (Number.isFinite(Number(data.seatBlend))) rp.seatBlend = clamp(Number(data.seatBlend), 0, 1);
+		if (data.name && rp.name !== data.name)
+		{
+			rp.name = data.name;
+			rp.group.remove(rp.label);
+			if (rp.label.material.map) rp.label.material.map.dispose();
+			rp.label.material.dispose();
+			rp.label = makeTextSprite(data.name);
+			rp.group.add(rp.label);
+			fitRemoteModel(rp);
+		}
+		const gender = normalizeGender(data.gender);
+		if (rp.gender !== gender)
+		{
+			rp.gender = gender;
+			loadRemotePlayerModel(data.id, rp, gender);
+		}
+		const modelScale = clamp(Number(data.modelScale) || rp.modelScale, 0.3, 3);
+		if (modelScale !== rp.modelScale) { rp.modelScale = modelScale; fitRemoteModel(rp); }
+		if (data.skin && rp.skin !== data.skin) { rp.skin = data.skin; applyRemoteSkin(rp); }
+		if (data.vehicle && data.vehicle.driver) updateRemoteVehicle(data.id, data.vehicle);
+	}
 
-                async createOffer(remoteConnId)
-                {
-                        if (this.connections.has(remoteConnId)) return;
-                        try
-                        {
-                                const pc = new RTCPeerConnection(ICE_CONFIG);
-                                const dc = pc.createDataChannel('pos', { ordered: false, maxRetransmits: 0 });
-                                this.connections.set(remoteConnId, { pc, dc: null, state: 'connecting' });
-                                this.wirePC(remoteConnId, pc);
-                                this.wireDC(remoteConnId, dc);
-                                const offer = await pc.createOffer();
-                                await pc.setLocalDescription(offer);
-                                session.channel.send({ type: 'broadcast', event: 'webrtc-offer', payload: { to: remoteConnId, from: session.connId, sdp: offer } });
-                                log('P2P offer sent to', remoteConnId.substring(0, 8));
-                        } catch (e) { warn('P2P offer failed', e); }
-                },
+	function normalizeVehicleType(type)
+	{
+		if (type === 1 || type === '1') return 'airplane';
+		if (type === 3 || type === '3') return 'heli';
+		if (type === 2 || type === '2') return 'car';
+		return typeof type === 'string' && /^[a-zA-Z0-9_-]{1,48}$/.test(type) ? type : 'car';
+	}
 
-                async onOffer(from, sdp)
-                {
-                        if (!this.enabled) return;
-                        try
-                        {
-                                let conn = this.connections.get(from);
-                                if (!conn)
-                                {
-                                        const pc = new RTCPeerConnection(ICE_CONFIG);
-                                        conn = { pc, dc: null, state: 'connecting' };
-                                        this.connections.set(from, conn);
-                                        this.wirePC(from, pc);
-                                }
-                                await conn.pc.setRemoteDescription(sdp);
-                                const answer = await conn.pc.createAnswer();
-                                await conn.pc.setLocalDescription(answer);
-                                session.channel.send({ type: 'broadcast', event: 'webrtc-answer', payload: { to: from, from: session.connId, sdp: answer } });
-                                log('P2P answer sent to', from.substring(0, 8));
-                        } catch (e) { warn('P2P answer failed', e); }
-                },
+	function createRemoteVehicle(id, vehicleType)
+	{
+		const THREE = window.THREE;
+		const w = RRMP.world;
+		if (!THREE || !w || !w.graphicsWorld) return null;
+		if (remoteVehicles[id]) return remoteVehicles[id];
+		const group = new THREE.Group();
+		group.name = 'RRMP vehicle ' + id;
+		w.graphicsWorld.add(group);
+		remoteVehicles[id] = group;
+		const type = normalizeVehicleType(vehicleType);
+		if (typeof w.realismLoadVehicleModel !== 'function')
+		{
+			warn('remote vehicle model loader is unavailable:', type);
+			return group;
+		}
+		w.realismLoadVehicleModel(type, (model) =>
+		{
+			if (remoteVehicles[id] !== group) return;
+			group.add(model);
+		}, () => warn('could not load remote vehicle model:', type));
+		return group;
+	}
 
-                async onAnswer(from, sdp)
-                {
-                        const conn = this.connections.get(from);
-                        if (!conn) return;
-                        try { await conn.pc.setRemoteDescription(sdp); } catch (e) { warn('P2P setRemoteDescription failed', e); }
-                },
+	function updateRemoteVehicle(owner, vehicle)
+	{
+		if (!vehicle || !vehicle.id || ![vehicle.x, vehicle.y, vehicle.z, vehicle.qx, vehicle.qy, vehicle.qz, vehicle.qw].every(Number.isFinite)) return;
+		const data = Object.assign({}, vehicle, { owner, receivedAt: Date.now() });
+		remoteVehicleTargets[vehicle.id] = data;
+		if (!findWorldVehicle(vehicle.id) && !remoteVehicles[vehicle.id]) createRemoteVehicle(vehicle.id, data.type);
+	}
 
-                async onIce(from, candidate)
-                {
-                        const conn = this.connections.get(from);
-                        if (!conn) return;
-                        try { await conn.pc.addIceCandidate(candidate); } catch (e) { /* ignore — can race with setRemoteDescription */ }
-                },
+	function disposeRemoteGroup(group)
+	{
+		group.traverse((node) =>
+		{
+			if (!node.material) return;
+			const materials = Array.isArray(node.material) ? node.material : [node.material];
+			materials.forEach((material) =>
+			{
+				if (node.isSprite && material.map) material.map.dispose();
+				material.dispose();
+			});
+		});
+	}
 
-                wirePC(remoteConnId, pc)
-                {
-                        pc.onicecandidate = (e) =>
-                        {
-                                if (e.candidate && session.channel)
-                                {
-                                        session.channel.send({ type: 'broadcast', event: 'webrtc-ice', payload: { to: remoteConnId, from: session.connId, candidate: e.candidate } });
-                                }
-                        };
-                        pc.ondatachannel = (e) => this.wireDC(remoteConnId, e.channel);
-                        pc.onconnectionstatechange = () =>
-                        {
-                                const c = this.connections.get(remoteConnId);
-                                if (!c) return;
-                                c.state = pc.connectionState;
-                                if (pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected')
-                                {
-                                        log('P2P', pc.connectionState, 'with', remoteConnId.substring(0, 8));
-                                }
-                        };
-                },
+	function findWorldVehicle(id)
+	{
+		const w = RRMP.world;
+		if (!w || !Array.isArray(w.vehicles)) return null;
+		for (const vehicle of w.vehicles)
+		{
+			if (vehicleId(vehicle) === id) return vehicle;
+		}
+		return null;
+	}
 
-                wireDC(remoteConnId, dc)
-                {
-                        dc.binaryType = 'arraybuffer';
-                        const c = this.connections.get(remoteConnId);
-                        if (c) c.dc = dc;
-                        dc.onopen = () => { if (c) c.state = 'connected'; log('P2P data channel open with', remoteConnId.substring(0, 8)); };
-                        dc.onclose = () => { if (c) c.state = 'closed'; log('P2P data channel closed with', remoteConnId.substring(0, 8)); };
-                        dc.onmessage = (e) =>
-                        {
-                                try
-                                {
-                                        const data = JSON.parse(e.data);
-                                        if (data.type === 'pos')
-                                        {
-                                                avatars.spawn(remoteConnId, { name: data.n, skinColor: data.s });
-                                                avatars.setTarget(remoteConnId, data);
-                                        }
-                                } catch (err) { /* ignore malformed */ }
-                        };
-                },
+	function removeRemotePlayer(id)
+	{
+		const rp = remotePlayers[id];
+		if (!rp) return;
+		const w = RRMP.world;
+		if (w && w.graphicsWorld) w.graphicsWorld.remove(rp.group);
+		disposeRemoteGroup(rp.group);
+		delete remotePlayers[id];
+		for (const vehicleIdValue in remoteVehicleTargets)
+		{
+			if (remoteVehicleTargets[vehicleIdValue].owner !== id) continue;
+			const localVehicle = findWorldVehicle(vehicleIdValue);
+			if (localVehicle && localVehicle.controllingCharacter && localVehicle.controllingCharacter !== getLocalPlayer()) continue;
+			delete remoteVehicleTargets[vehicleIdValue];
+			const proxy = remoteVehicles[vehicleIdValue];
+			if (proxy)
+			{
+				if (w && w.graphicsWorld) w.graphicsWorld.remove(proxy);
+				disposeRemoteGroup(proxy);
+				delete remoteVehicles[vehicleIdValue];
+			}
+		}
+		log('remote player removed:', id.slice(0, 8));
+	}
 
-                // Send position via all open data channels. Returns true if at least
-                // one channel was open (so the caller can skip the Supabase broadcast).
-                sendTransform(tr)
-                {
-                        if (!this.enabled || this.connections.size === 0) return false;
-                        const msg = JSON.stringify({ type: 'pos', n: identity.name, s: identity.skinColor, t: tr.t, r: tr.r, m: tr.m });
-                        let sent = false;
-                        this.connections.forEach((conn) =>
-                        {
-                                if (conn.dc && conn.dc.readyState === 'open')
-                                {
-                                        try { conn.dc.send(msg); sent = true; } catch (e) { /* ignore */ }
-                                }
-                        });
-                        return sent;
-                },
+	let shotSequence = 0;
+	const receivedShotSequences = {};
+	const shotRate = {};
+	let playerDead = false;
 
-                closePeer(remoteConnId)
-                {
-                        const conn = this.connections.get(remoteConnId);
-                        if (!conn) return;
-                        try { if (conn.dc) conn.dc.close(); } catch (e) { /* ignore */ }
-                        try { conn.pc.close(); } catch (e) { /* ignore */ }
-                        this.connections.delete(remoteConnId);
-                },
+	function rayHitsLocalPlayer(origin, direction, range)
+	{
+		const ch = getLocalPlayer();
+		const w = RRMP.world;
+		if (!ch || playerDead) return null;
+		const THREE = window.THREE;
+		const pos = new THREE.Vector3();
+		ch.getWorldPosition(pos);
+		const t = (pos.x - origin.x) * direction.x + (pos.y + 0.45 - origin.y) * direction.y + (pos.z - origin.z) * direction.z;
+		if (t < 0 || t > range) return null;
+		const y = origin.y + direction.y * t;
+		const targetY = clamp(y, pos.y - 0.12, pos.y + 1.15);
+		const dx = origin.x + direction.x * t - pos.x;
+		const dy = origin.y + direction.y * t - targetY;
+		const dz = origin.z + direction.z * t - pos.z;
+		if (dx * dx + dy * dy + dz * dz > 0.45 * 0.45) return null;
 
-                closeAll()
-                {
-                        this.connections.forEach((_, id) => this.closePeer(id));
-                },
-        };
+		try
+		{
+			const from = { x: origin.x, y: origin.y, z: origin.z };
+			const to = { x: origin.x + direction.x * t, y: origin.y + direction.y * t, z: origin.z + direction.z * t };
+			const cannon = window.CANNON;
+			const result = cannon && new cannon.RaycastResult();
+			if (result && w.physicsWorld)
+			{
+				const a = new cannon.Vec3(from.x, from.y, from.z);
+				const b = new cannon.Vec3(to.x, to.y, to.z);
+				// Character capsules are collision group 2; check walls and vehicle bodies only.
+				// tslint:disable-next-line: no-bitwise
+				const targetVehicle = ch.occupyingSeat && ch.occupyingSeat.vehicle && ch.occupyingSeat.vehicle.collision;
+				if (w.physicsWorld.raycastClosest(a, b, { collisionFilterMask: ~2, skipBackfaces: true }, result) &&
+					result.hasHit && result.body !== targetVehicle && result.distance < t - 0.2) return null;
+			}
+		} catch (e) { /* the hit still works if physics raycasting is unavailable */ }
+		return t;
+	}
 
-        // ======================================================================
-        //  Session (join / leave / presence / broadcast / heartbeat)
-        //  connId is a FRESH UUID per join (in-memory, not localStorage) so that
-        //  two tabs of the same browser get two different session rows, two
-        //  different Presence keys, and can see each other's avatars.
-        // ======================================================================
-        const session = RRMP.session = {
-                server: null,
-                channel: null,
-                connId: null,            // fresh UUID per join (connection identity)
-                mode: 'global',          // 'global' (Supabase broadcast) | 'lan' (WebRTC P2P)
-                heartbeatTimer: null,
-                sendTimer: null,
-                lastSend: 0,
-                leaving: false,
+	function receiveShot(payload)
+	{
+		if (!payload || payload.id === connId || typeof payload.id !== 'string') return;
+		const seq = Number(payload.seq);
+		if (!Number.isInteger(seq) || seq <= (receivedShotSequences[payload.id] || 0)) return;
+		receivedShotSequences[payload.id] = seq;
+		const now = performance.now();
+		if (now - (shotRate[payload.id] || 0) < 30) return;
+		shotRate[payload.id] = now;
+		const shots = Array.isArray(payload.shots) ? payload.shots.slice(0, 16) : [payload];
+		let totalDamage = 0;
+		for (const shot of shots)
+		{
+			const origin = shot.origin, direction = shot.direction;
+			if (!origin || !direction || ![origin.x, origin.y, origin.z, direction.x, direction.y, direction.z, shot.range, shot.damage].every(Number.isFinite)) continue;
+			const range = clamp(shot.range, 0, 250);
+			const damage = clamp(shot.damage, 0, 100);
+			const len = Math.hypot(direction.x, direction.y, direction.z);
+			if (range <= 0 || damage <= 0 || len < 0.0001) continue;
+			const dir = { x: direction.x / len, y: direction.y / len, z: direction.z / len };
+			const distance = rayHitsLocalPlayer(origin, dir, range);
+			if (distance === null) continue;
+			const falloff = distance < range * 0.5 ? 1 : 1 - 0.5 * Math.min(1, (distance - range * 0.5) / (range * 0.5));
+			totalDamage += damage * falloff;
+		}
+		if (totalDamage <= 0) return;
+		RRMP.combat.health = Math.max(0, RRMP.combat.health - totalDamage);
+		ui.updateHealth();
+		if (RRMP.combat.health <= 0) eliminatePlayer(payload.id);
+	}
 
-                async join(server, mode)
-                {
-                        if (this.server) await this.leave();
-                        this.leaving = false;
-                        this.server = server;
-                        this.mode = mode || 'global';
-                        this.connId = uuid();             // fresh connection UUID
-                        p2p.enabled = this.mode === 'lan';
-                        log('joining server', server.name, 'mode=' + this.mode, 'connId=' + this.connId.substring(0, 8));
+	function eliminatePlayer(attackerId)
+	{
+		if (playerDead) return;
+		playerDead = true;
+		RRMP.combat.deaths++;
+		ui.updateHealth();
+		ui.toast('You were eliminated by ' + (remotePlayers[attackerId] ? remotePlayers[attackerId].name : 'another player'));
+		if (session.channel)
+		{
+			session.channel.send({ type: 'broadcast', event: 'death', payload: { victim: connId, attacker: attackerId } });
+		}
+		const ch = getLocalPlayer();
+		if (ch)
+		{
+			if (ch.resetControls) ch.resetControls();
+			if (ch.occupyingSeat && ch.exitVehicle) ch.exitVehicle();
+			ch.visible = false;
+			if (RRMP.world && RRMP.world.inputManager && RRMP.world.cameraOperator)
+			{
+				RRMP.world.inputManager.setInputReceiver(RRMP.world.cameraOperator);
+			}
+		}
+		setTimeout(() =>
+		{
+			const character = getLocalPlayer();
+			const world = RRMP.world;
+			if (character && world && world.respawnPosition)
+			{
+				if (character.controlledObject && character.stopControllingVehicle) character.stopControllingVehicle();
+				if (character.parent !== world.graphicsWorld) world.graphicsWorld.attach(character);
+				if (character.occupyingSeat && character.leaveSeat) character.leaveSeat();
+				if (character.vehicleEntryInstance !== undefined) character.vehicleEntryInstance = null;
+				if (character.setPhysicsEnabled) character.setPhysicsEnabled(false);
+				character.setPosition(world.respawnPosition.x, world.respawnPosition.y + 1, world.respawnPosition.z);
+				if (character.setPhysicsEnabled) character.setPhysicsEnabled(true);
+				character.setPosition(world.respawnPosition.x, world.respawnPosition.y + 1, world.respawnPosition.z);
+				if (character.resetVelocity) character.resetVelocity();
+				character.visible = true;
+				if (character.takeControl) character.takeControl();
+			}
+			playerDead = false;
+			RRMP.combat.health = 100;
+			ui.updateHealth();
+			ui.toast('Respawned');
+		}, 2500);
+	}
 
-                        // 1. DB session row (so the player counts toward the server's player_count)
-                        await db.joinSession(server, this.connId);
+	function receiveDeath(payload)
+	{
+		if (payload && payload.attacker === connId && payload.victim !== connId)
+		{
+			RRMP.combat.kills++;
+			ui.updateHealth();
+			ui.toast('Player eliminated');
+		}
+	}
 
-                        // 2. Realtime channel: presence + broadcast (and P2P signaling in LAN mode)
-                        const ch = RRMP.supabase.channel('server:' + server.id, {
-                                config: { presence: { key: this.connId } },
-                        });
-                        this.channel = ch;
+	function maybeStartOnline()
+	{
+		const world = RRMP.world;
+		const uiState = world && world.realismUI;
+		if (!session.connected || !uiState || !uiState.loaded || uiState.state !== 'start') return;
+		if (typeof uiState.play === 'function') uiState.play();
+	}
 
-                        ch.on('presence', { event: 'sync' }, () => this.onPresenceSync());
-                        ch.on('presence', { event: 'join' }, ({ key, newPresences }) =>
-                        {
-                                (newPresences || []).forEach((p) =>
-                                {
-                                        if (!p || !p.id || p.id === this.connId) return;
-                                        avatars.spawn(p.id, p);
-                                        if (p2p.enabled) p2p.onPeerSeen(p.id);
-                                });
-                        });
-                        ch.on('presence', { event: 'leave' }, ({ key, leftPresences }) =>
-                        {
-                                (leftPresences || []).forEach((p) =>
-                                {
-                                        if (!p || !p.id || p.id === this.connId) return;
-                                        avatars.remove(p.id);
-                                        if (p2p.enabled) p2p.closePeer(p.id);
-                                });
-                        });
+	// ======================================================================
+	//  Realtime — EXACTLY the template pattern
+	// ======================================================================
+	const session = RRMP.session = {
+		server: null,
+		channel: null,
+		connected: false,
+		lastSeenTransform: null,
+		lastBroadcast: 0,
+		heartbeatTimer: null,
 
-                        // Position updates via Supabase broadcast (Global mode, and P2P fallback)
-                        ch.on('broadcast', { event: 'pos' }, ({ payload }) =>
-                        {
-                                if (!payload || !payload.id || payload.id === this.connId) return;
-                                avatars.spawn(payload.id, { name: payload.n, skinColor: payload.s });
-                                avatars.setTarget(payload.id, payload);
-                        });
+		join(server)
+		{
+			if (this.channel) this.leave();
+			this.server = server;
+			// EXACTLY like the template:
+			const channel = RRMP.supabase.channel('server:' + server.id, {
+				config: {
+					presence: { key: connId },
+					broadcast: { self: false },
+				},
+			});
+			this.channel = channel;
 
-                        // WebRTC signaling (LAN mode only — ignored in global mode)
-                        ch.on('broadcast', { event: 'webrtc-offer' }, ({ payload }) =>
-                        {
-                                if (!payload || payload.to !== this.connId) return;
-                                p2p.onOffer(payload.from, payload.sdp);
-                        });
-                        ch.on('broadcast', { event: 'webrtc-answer' }, ({ payload }) =>
-                        {
-                                if (!payload || payload.to !== this.connId) return;
-                                p2p.onAnswer(payload.from, payload.sdp);
-                        });
-                        ch.on('broadcast', { event: 'webrtc-ice' }, ({ payload }) =>
-                        {
-                                if (!payload || payload.to !== this.connId) return;
-                                p2p.onIce(payload.from, payload.candidate);
-                        });
+			channel
+				.on('presence', { event: 'sync' }, () => this.onPresenceSync())
+				.on('presence', { event: 'leave' }, ({ leftPresences }) =>
+				{
+					for (const p of leftPresences || []) removeRemotePlayer(p.key);
+					this.updateCount();
+				})
+				.on('broadcast', { event: 'move' }, ({ payload }) =>
+				{
+					RRMP.stats.recv++;
+					if (payload.id === connId) return;
+					updateRemotePlayer(payload);
+				})
+				.on('broadcast', { event: 'shot' }, ({ payload }) => receiveShot(payload))
+				.on('broadcast', { event: 'death' }, ({ payload }) => receiveDeath(payload))
+				.on('broadcast', { event: 'police_radio' }, ({ payload }) =>
+				{
+					if (!payload || payload.id === connId || !payload.id || !this.server || payload.serverId !== this.server.id) return;
+					if (POLICE_RADIO_CHANNELS.indexOf(payload.channel) < 0 ||
+						(payload.department !== 'police' && payload.department !== 'sheriff')) return;
+					if (typeof payload.message !== 'string' || !payload.message.trim() || payload.message.length > 240) return;
+					if (typeof payload.timestamp !== 'number' || Math.abs(Date.now() - payload.timestamp) > 60000) return;
+					const safe = {
+						id: String(payload.id).slice(0, 64),
+						name: String(payload.name || 'Officer').slice(0, 16),
+						channel: payload.channel,
+						department: payload.department,
+						unit: String(payload.unit || 'Unknown unit').slice(0, 24),
+						message: payload.message.trim(),
+						timestamp: payload.timestamp,
+					};
+					for (const listener of policeRadioListeners.slice())
+					{
+						try { listener(safe); } catch (e) { warn('police radio listener failed', e); }
+					}
+				})
+				.subscribe(async (status, err) =>
+				{
+					console.log('[Realtime] status:', status, 'err:', err || '');
+					RRMP.stats.channelStatus = status;
+					ui.updateDebug();
+					if (status === 'SUBSCRIBED')
+					{
+						try
+						{
+							await channel.track({ id: connId, name: identity.name, skin: identity.skinColor });
+						}
+						catch (trackError)
+						{
+							warn('presence track failed', trackError);
+							return;
+						}
+						// Initial broadcast — same as template
+						const payload = this.currentPayload();
+						if (payload)
+						{
+							channel.send({ type: 'broadcast', event: 'move', payload });
+							RRMP.stats.sent++;
+						}
+						db.joinSession(server.id).catch((e) => warn('session insert failed', e));
+						if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+						this.heartbeatTimer = setInterval(() => db.heartbeat(server.id).catch(() => { /* non-fatal */ }), RRMP.config.heartbeatSeconds * 1000);
+						this.connected = true;
+						ui.showStatus(server);
+						ui.showDebug();
+						maybeStartOnline();
+						log('SUBSCRIBED — connected to', server.name);
+					}
+					else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED')
+					{
+						this.connected = false;
+						ui.updateStatusCount(RRMP.stats.presenceCount);
+						warn('Realtime:', status, '— players will not sync');
+					}
+				});
 
-                        ch.subscribe(async (status) =>
-                        {
-                                if (status === 'SUBSCRIBED')
-                                {
-                                        await ch.track({ id: this.connId, playerId: identity.id, name: identity.name, skinColor: identity.skinColor });
-                                        log('presence tracked', this.connId.substring(0, 8));
-                                }
-                                else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT')
-                                {
-                                        warn('realtime channel', status);
-                                }
-                        });
+			this.updateCount();
+		},
 
-                        // 3. heartbeat (keeps the session row fresh for the player count)
-                        this.heartbeatTimer = setInterval(() => { if (this.connId) db.heartbeat(server.id, this.connId).catch(() => { /* non-fatal */ }); }, RRMP.config.heartbeatSeconds * 1000);
+		currentPayload()
+		{
+			const tr = readLocalTransform();
+			if (!tr) return null;
+			return {
+				id: connId, name: identity.name, skin: identity.skinColor,
+				gender: tr.gender, modelScale: tr.modelScale, seatBlend: tr.seatBlend,
+				x: tr.x, y: tr.y, z: tr.z, ry: tr.ry, vehicle: tr.vehicle || null,
+			};
+		},
 
-                        // 4. broadcast loop
-                        const interval = 1000 / RRMP.config.sendRateHz;
-                        this.sendTimer = setInterval(() => this.sendTransform(), interval);
+		onPresenceSync()
+		{
+			const state = this.channel ? this.channel.presenceState() : {};
+			const online = Object.keys(state || {});
+			RRMP.stats.presenceCount = online.length;
+			// Remove avatars for players no longer online (template pattern)
+			for (const id of Object.keys(remotePlayers)) if (!online.includes(id)) removeRemotePlayer(id);
+			// When a NEW peer appears, re-broadcast our position so they can see us.
+			// (The template misses this — standing-still players were invisible to joiners.)
+			for (const id of online)
+			{
+				if (id === connId) continue;
+				if (!remotePlayers[id] && !this._greeted) { /* noop */ }
+				if (!this['seen_' + id])
+				{
+					this['seen_' + id] = true;
+					log('new peer detected:', id.slice(0, 8), '— sending our position');
+					const payload = this.currentPayload();
+					if (payload)
+					{
+						this.channel.send({ type: 'broadcast', event: 'move', payload });
+						RRMP.stats.sent++;
+					}
+				}
+			}
+			this.updateCount();
+			ui.updateDebug();
+		},
 
-                        // 5. start the game (same path as Free Roam's Play button)
-                        startGame();
+		updateCount()
+		{
+			try
+			{
+				const state = this.channel ? this.channel.presenceState() : {};
+				const n = Object.keys(state || {}).length;
+				RRMP.stats.presenceCount = n;
+				ui.updateStatusCount(n);
+			} catch (e) { /* ignore */ }
+		},
 
-                        ui.showStatus(server, this.mode);
-                        log('joined server', server.name, server.id, 'mode=' + this.mode);
-                },
+		// Called every frame from the game loop — broadcast on movement (template pattern)
+		tick()
+		{
+			if (!this.channel || RRMP.stats.channelStatus !== 'SUBSCRIBED') return;
+			const tr = readLocalTransform();
+			if (!tr) return;
+			const prev = this.lastSeenTransform;
+			const moved = !prev || Math.abs(prev.x - tr.x) > 0.05 || Math.abs(prev.y - tr.y) > 0.05 || Math.abs(prev.z - tr.z) > 0.05 || Math.abs(prev.ry - tr.ry) > 0.02;
+			const now = performance.now();
+			const interval = 1000 / RRMP.config.sendRateHz;
+			// Broadcast on movement at sendRateHz, plus a 2s keepalive when idle
+			if ((moved && now - this.lastBroadcast > interval) || now - this.lastBroadcast > 2000)
+			{
+				this.lastBroadcast = now;
+				this.lastSeenTransform = tr;
+				this.channel.send({ type: 'broadcast', event: 'move', payload: this.currentPayload() });
+				RRMP.stats.sent++;
+			}
+		},
 
-                sendTransform()
-                {
-                        if (this.leaving || !this.channel) return;
-                        const tr = readLocalTransform();
-                        if (!tr) return;
-                        const t = now();
-                        if (t - this.lastSend < (1000 / RRMP.config.sendRateHz) - 2) return;
-                        this.lastSend = t;
+		// Per-frame avatar lerp
+		lerpAvatars(dt)
+		{
+			const k = 1 - Math.pow(0.001, dt);
+			for (const id in remotePlayers)
+			{
+				const rp = remotePlayers[id];
+				const oldX = rp.group.position.x, oldZ = rp.group.position.z;
+				rp.group.position.x = lerp(rp.group.position.x, rp.tx, k);
+				rp.group.position.y = lerp(rp.group.position.y, rp.ty, k);
+				rp.group.position.z = lerp(rp.group.position.z, rp.tz, k);
+				const speed = Math.hypot(rp.group.position.x - oldX, rp.group.position.z - oldZ) / Math.max(dt, 0.001);
+				setRemoteAnimation(rp, speed > 3.2 ? 'run' : speed > 0.25 ? 'walk' : 'idle');
+				if (rp.mixer) rp.mixer.update(dt);
+				let dyaw = rp.tryaw - rp.group.rotation.y;
+				while (dyaw > Math.PI) dyaw -= Math.PI * 2;
+				while (dyaw < -Math.PI) dyaw += Math.PI * 2;
+				rp.group.rotation.y += dyaw * k;
+			}
+			for (const id in remoteVehicleTargets)
+			{
+				const target = remoteVehicleTargets[id];
+				const localVehicle = findWorldVehicle(id);
+				if (localVehicle)
+				{
+					if (localVehicle.controllingCharacter && localVehicle.controllingCharacter === getLocalPlayer()) continue;
+					const body = localVehicle.collision;
+					if (!body) continue;
+					const THREE = window.THREE;
+					const rotation = new THREE.Quaternion(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w)
+						.slerp(new THREE.Quaternion(target.qx, target.qy, target.qz, target.qw), k);
+					const pose = {
+						x: lerp(body.position.x, target.x, k), y: lerp(body.position.y, target.y, k), z: lerp(body.position.z, target.z, k),
+						qx: rotation.x, qy: rotation.y, qz: rotation.z, qw: rotation.w,
+						vx: target.vx || 0, vy: target.vy || 0, vz: target.vz || 0,
+					};
+					setBodyPose(body, pose);
+					continue;
+				}
+				const proxy = remoteVehicles[id] || createRemoteVehicle(id, target.type);
+				if (proxy)
+				{
+					proxy.position.set(lerp(proxy.position.x, target.x, k), lerp(proxy.position.y, target.y, k), lerp(proxy.position.z, target.z, k));
+					proxy.quaternion.slerp(new window.THREE.Quaternion(target.qx, target.qy, target.qz, target.qw), k);
+					proxy.updateMatrixWorld();
+				}
+			}
+		},
 
-                        // In LAN mode, try P2P data channels first. If at least one channel
-                        // is open, skip the Supabase broadcast (positions go direct P2P).
-                        // If no channels are open yet (still negotiating), fall back to
-                        // Supabase broadcast so movement is visible during the handoff.
-                        if (p2p.enabled && p2p.sendTransform(tr)) return;
+		leave()
+		{
+			this.connected = false;
+			if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+			if (this.channel) { try { this.channel.unsubscribe(); } catch (e) { /* ignore */ } this.channel = null; }
+			for (const id of Object.keys(remotePlayers)) removeRemotePlayer(id);
+			if (this.server) db.leaveSession(this.server.id).catch(() => { /* non-fatal */ });
+			this.server = null;
+			this.lastSeenTransform = null;
+			playerDead = false;
+			RRMP.combat.health = 100;
+			RRMP.stats = { channelStatus: null, presenceCount: 0, sent: 0, recv: 0 };
+			ui.updateHealth();
+			ui.hideStatus(); ui.hideDebug();
+			log('left server');
+		},
+	};
 
-                        // Global mode, or P2P fallback
-                        this.channel.send({
-                                type: 'broadcast', event: 'pos',
-                                payload: { id: this.connId, n: identity.name, s: identity.skinColor, t: tr.t, r: tr.r, m: tr.m },
-                        });
-                },
+	RRMP.broadcastShot = function (shot)
+	{
+		const channel = session.channel;
+		if (!channel || !session.connected || RRMP.stats.channelStatus !== 'SUBSCRIBED') return;
+		shotSequence++;
+		channel.send({
+			type: 'broadcast',
+			event: 'shot',
+			payload: Object.assign({ id: connId, seq: shotSequence }, shot),
+		});
+		RRMP.stats.sent++;
+	};
+	RRMP.broadcastShots = function (shots)
+	{
+		const channel = session.channel;
+		if (!channel || !session.connected || RRMP.stats.channelStatus !== 'SUBSCRIBED' || !Array.isArray(shots) || !shots.length) return;
+		shotSequence++;
+		channel.send({
+			type: 'broadcast',
+			event: 'shot',
+			payload: { id: connId, seq: shotSequence, shots: shots.slice(0, 16) },
+		});
+		RRMP.stats.sent++;
+	};
+	RRMP.getRemoteRadarVehicles = function ()
+	{
+		const now = Date.now();
+		const result = [];
+		for (const id in remoteVehicleTargets)
+		{
+			const vehicle = remoteVehicleTargets[id];
+			if (!vehicle || now - vehicle.receivedAt > 2500 ||
+				![vehicle.x, vehicle.y, vehicle.z, vehicle.vx, vehicle.vy, vehicle.vz].every(Number.isFinite)) continue;
+			result.push({ id: id, x: vehicle.x, y: vehicle.y, z: vehicle.z, vx: vehicle.vx, vy: vehicle.vy, vz: vehicle.vz });
+		}
+		return result;
+	};
 
-                onPresenceSync()
-                {
-                        if (!this.channel) return;
-                        const state = this.channel.presenceState() || {};
-                        const ids = new Set();
-                        for (const key in state)
-                        {
-                                const arr = state[key];
-                                if (!arr) continue;
-                                arr.forEach((p) =>
-                                {
-                                        if (!p || !p.id) return;
-                                        if (p.id === this.connId) return;
-                                        ids.add(p.id);
-                                        avatars.spawn(p.id, p);
-                                        if (p2p.enabled) p2p.onPeerSeen(p.id);
-                                });
-                        }
-                        // remove avatars for players no longer present
-                        avatars.map.forEach((_, id) => { if (!ids.has(id)) { avatars.remove(id); if (p2p.enabled) p2p.closePeer(id); } });
-                        // update HUD count
-                        ui.updateStatusCount(Object.keys(state).length);
-                },
+	RRMP.onPoliceRadio = function (listener)
+	{
+		if (typeof listener !== 'function') return function () {};
+		policeRadioListeners.push(listener);
+		return function ()
+		{
+			const index = policeRadioListeners.indexOf(listener);
+			if (index >= 0) policeRadioListeners.splice(index, 1);
+		};
+	};
+	RRMP.sendPoliceRadio = function (message)
+	{
+		const channel = session.channel;
+		if (!channel || !session.connected || RRMP.stats.channelStatus !== 'SUBSCRIBED' || !session.server || !message) return false;
+		if (POLICE_RADIO_CHANNELS.indexOf(message.channel) < 0 ||
+			(message.department !== 'police' && message.department !== 'sheriff') ||
+			typeof message.message !== 'string' || !message.message.trim()) return false;
+		const payload = {
+			id: connId,
+			name: String(identity.name || 'Officer').slice(0, 16),
+			serverId: session.server.id,
+			channel: message.channel,
+			department: message.department,
+			unit: String(message.unit || 'Unknown unit').slice(0, 24),
+			message: message.message.trim().slice(0, 240),
+			timestamp: Date.now(),
+		};
+		try
+		{
+			const result = channel.send({ type: 'broadcast', event: 'police_radio', payload: payload });
+			if (result && typeof result.catch === 'function') result.catch((e) => warn('police radio broadcast failed', e));
+			RRMP.stats.sent++;
+			return true;
+		}
+		catch (e) { warn('police radio broadcast failed', e); return false; }
+	};
 
-                async leave()
-                {
-                        this.leaving = true;
-                        const srv = this.server;
-                        const cid = this.connId;
-                        try
-                        {
-                                if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
-                                if (this.sendTimer) { clearInterval(this.sendTimer); this.sendTimer = null; }
-                                p2p.closeAll();
-                                if (this.channel)
-                                {
-                                        try { await this.channel.unsubscribe(); } catch (e) { /* ignore */ }
-                                        try { RRMP.supabase.removeChannel(this.channel); } catch (e) { /* ignore */ }
-                                        this.channel = null;
-                                }
-                                if (srv && cid) await db.leaveSession(srv.id, cid);
-                        } catch (e) { warn('leave error', e); }
-                        avatars.clear();
-                        this.server = null;
-                        this.connId = null;
-                        ui.hideStatus();
-                        log('left server');
-                },
-        };
+	window.addEventListener('beforeunload', () =>
+	{
+		if (session.channel) { try { session.channel.unsubscribe(); } catch (e) { /* ignore */ } }
+		if (session.server) { try { db.leaveSession(session.server.id); } catch (e) { /* ignore */ } }
+	});
 
-        // hard cleanup on tab close / navigate — delete the session row by connId
-        window.addEventListener('beforeunload', () =>
-        {
-                if (!session.server || !session.connId) return;
-                const url = (window.SUPABASE_CONFIG.url || '') + '/rest/v1/server_sessions?id=eq.' + encodeURIComponent(session.connId) + '&server_id=eq.' + encodeURIComponent(session.server.id);
-                const headers = { 'apikey': window.SUPABASE_CONFIG.anonKey, 'Authorization': 'Bearer ' + window.SUPABASE_CONFIG.anonKey };
-                try { fetch(url, { method: 'DELETE', headers, keepalive: true }); } catch (e) { /* ignore */ }
-                try { session.channel && session.channel.unsubscribe(); } catch (e) { /* ignore */ }
-                try { p2p.closeAll(); } catch (e) { /* ignore */ }
-        });
-        document.addEventListener('visibilitychange', () =>
-        {
-                if (!document.hidden && session.server && session.connId) db.heartbeat(session.server.id, session.connId).catch(() => { /* non-fatal */ });
-        });
-
-        function startGame()
-        {
-                const w = RRMP.world;
-                const ui_ = w && w.realismUI;
-                if (ui_ && typeof ui_.play === 'function' && ui_.state === 'start') ui_.play();
-        }
-
-        // ======================================================================
-        //  UI: CSS + modals
-        // ======================================================================
-        function injectCSS()
-        {
-                if (document.getElementById('rrmp-css')) return;
-                const s = el('style', null, `
-.rrmp-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:rgba(6,8,12,.78);backdrop-filter:blur(3px);font-family:Solway,Alfa Slab One,Arial,sans-serif;color:#f4f1ea}
+	// ======================================================================
+	//  UI
+	// ======================================================================
+	function injectCSS()
+	{
+		if (document.getElementById('rrmp-css')) return;
+		const s = el('style', null, `
+.rrmp-overlay{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:rgba(6,8,12,.78);backdrop-filter:blur(3px);font-family:Solway,Arial,sans-serif;color:#f4f1ea}
 .rrmp-card{width:min(680px,92vw);max-height:86vh;overflow:auto;background:linear-gradient(180deg,#171b24,#0e1117);border:1px solid #2b3242;border-radius:14px;box-shadow:0 30px 80px rgba(0,0,0,.6);padding:26px 28px}
-.rrmp-card h2{margin:0 0 6px;font-family:'Alfa Slab One',serif;letter-spacing:.5px;color:#ffd27a;font-size:24px}
-.rrmp-sub{color:#9aa3b2;font-size:13px;margin:0 0 18px}
+.rrmp-card h2{margin:0 0 6px;font-family:'Alfa Slab One',serif;color:#ffd27a;font-size:24px}
+.rrmp-sub{color:#9aa3b2;font-size:13px;margin:0 0 14px}
 .rrmp-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
 .rrmp-row label{flex:0 0 120px;color:#cfd6e3;font-size:13px}
 .rrmp-input,.rrmp-select{flex:1;min-width:160px;background:#0c0f15;border:1px solid #2b3242;color:#f4f1ea;border-radius:8px;padding:9px 11px;font-size:14px;font-family:inherit}
-.rrmp-input:focus,.rrmp-select:focus{outline:none;border-color:#ffd27a}
-.rrmp-btn{background:#222834;color:#f4f1ea;border:1px solid #364056;border-radius:8px;padding:9px 14px;font-size:14px;font-family:inherit;cursor:pointer;transition:.12s}
+.rrmp-input:focus{outline:none;border-color:#ffd27a}
+.rrmp-btn{background:#222834;color:#f4f1ea;border:1px solid #364056;border-radius:8px;padding:9px 14px;font-size:14px;font-family:inherit;cursor:pointer}
 .rrmp-btn:hover{background:#2c3445;border-color:#4a546b}
 .rrmp-btn:disabled{opacity:.45;cursor:not-allowed}
 .rrmp-btn.rrmp-primary{background:linear-gradient(180deg,#ffd27a,#e8b25a);color:#1a1206;border:none;font-weight:700}
-.rrmp-btn.rrmp-primary:hover{filter:brightness(1.06)}
 .rrmp-btn.rrmp-danger{background:#3a1c1c;border-color:#5a2a2a;color:#ffb3b3}
 .rrmp-btn.rrmp-ghost{background:transparent}
-.rrmp-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px;flex-wrap:wrap}
-.rrmp-list{display:flex;flex-direction:column;gap:8px;margin:6px 0 4px}
+.rrmp-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}
+.rrmp-list{display:flex;flex-direction:column;gap:8px;margin:6px 0}
 .rrmp-srv{display:flex;align-items:center;gap:12px;background:#0c0f15;border:1px solid #242b39;border-radius:10px;padding:11px 14px}
-.rrmp-srv:hover{border-color:#3a465e}
 .rrmp-srv-info{flex:1;min-width:0}
-.rrmp-srv-name{font-weight:700;color:#f4f1ea;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rrmp-srv-name{font-weight:700;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .rrmp-srv-meta{color:#8b94a5;font-size:12px;margin-top:2px}
-.rrmp-srv-count{font-variant-numeric:tabular-nums;color:#ffd27a;font-weight:700;font-size:13px;background:#1a1206;border:1px solid #4a3a1a;border-radius:20px;padding:3px 10px;white-space:nowrap}
+.rrmp-srv-count{color:#ffd27a;font-weight:700;font-size:13px;background:#1a1206;border:1px solid #4a3a1a;border-radius:20px;padding:3px 10px}
 .rrmp-srv-count.full{color:#ff9a9a;background:#2a1212;border-color:#5a2a2a}
-.rrmp-badge{font-size:10px;letter-spacing:.5px;text-transform:uppercase;background:#1d2533;color:#9fc0ff;border-radius:4px;padding:2px 6px}
-.rrmp-badge.priv{background:#2a1f33;color:#d6a9ff}
+.rrmp-badge{font-size:10px;text-transform:uppercase;background:#1d2533;color:#9fc0ff;border-radius:4px;padding:2px 6px}
 .rrmp-empty{text-align:center;color:#7f8898;padding:30px 10px}
-.rrmp-spin{display:inline-block;width:14px;height:14px;border:2px solid #444;border-top-color:#ffd27a;border-radius:50%;animation:rrmp-spin .7s linear infinite;vertical-align:middle}
+.rrmp-spin{display:inline-block;width:14px;height:14px;border:2px solid #444;border-top-color:#ffd27a;border-radius:50%;animation:rrmp-spin .7s linear infinite}
 @keyframes rrmp-spin{to{transform:rotate(360deg)}}
 .rrmp-err{color:#ff9a9a;background:#2a1212;border:1px solid #5a2a2a;border-radius:8px;padding:8px 11px;font-size:13px;margin:8px 0}
 .rrmp-swatches{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
 .rrmp-sw{width:30px;height:30px;border-radius:50%;border:2px solid #2b3242;cursor:pointer}
-.rrmp-sw.sel{border-color:#ffd27a;box-shadow:0 0 0 2px rgba(255,210,122,.4)}
+.rrmp-sw.sel{border-color:#ffd27a}
 .rrmp-preview{width:84px;height:84px;border-radius:50%;border:2px solid #2b3242;margin-left:auto}
 .rrmp-status{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;align-items:center;gap:10px;background:rgba(14,17,23,.92);border:1px solid #2b3242;border-radius:20px;padding:6px 14px;font-family:Solway,Arial,sans-serif;font-size:13px;color:#f4f1ea}
-.rrmp-dot{width:8px;height:8px;border-radius:50%;background:#46d27a;box-shadow:0 0 6px #46d27a}
-.rrmp-hint{font-size:11px;color:#8b94a5;margin-top:10px;text-align:center}
-.rrmp-mode-toggle{display:flex;gap:0;background:#0c0f15;border:1px solid #2b3242;border-radius:8px;overflow:hidden;margin:0 0 12px}
-.rrmp-mode-toggle button{flex:1;background:transparent;color:#8b94a5;border:none;padding:10px 14px;font-size:13px;font-family:inherit;cursor:pointer;transition:.12s;border-bottom:2px solid transparent}
-.rrmp-mode-toggle button.active{color:#ffd27a;background:#1a1206;border-bottom-color:#ffd27a;font-weight:700}
-.rrmp-mode-toggle button:hover:not(.active){color:#cfd6e3;background:#11151c}
-.rrmp-mode-desc{font-size:12px;color:#6b7585;margin:-6px 0 10px;padding:0 4px}
-/* start-screen injected buttons ride along the existing .rr-menu */
+.rrmp-dot{width:8px;height:8px;border-radius:50%;background:#3ecf8e;box-shadow:0 0 6px #3ecf8e}
+.rrmp-dot.warn{background:#facc15;box-shadow:0 0 6px #facc15}
+.rrmp-debug{position:fixed;bottom:12px;left:12px;z-index:9999;background:rgba(14,17,23,.92);border:1px solid #2b3242;border-radius:8px;padding:6px 10px;font-family:monospace;font-size:11px;color:#9fc0ff;pointer-events:none}
+.rrmp-debug b{color:#ffd27a}
+.rrmp-debug .ok{color:#3ecf8e}
+.rrmp-debug .err{color:#ef4444}
+.rrmp-debug .warn{color:#facc15}
 .rr-menu .rrmp-btn{margin-top:8px}
-                `);
-                s.id = 'rrmp-css';
-                document.head.appendChild(s);
-        }
+		`);
+		s.id = 'rrmp-css';
+		document.head.appendChild(s);
+	}
 
-        const SKIN_PRESETS = ['#f5d5b8', '#e8b48c', '#c68642', '#a56638', '#7a4a2a', '#5a3320', '#3a2218', '#dcb78c'];
+	const SKIN_PRESETS = ['#f5d5b8', '#e8b48c', '#c68642', '#a56638', '#7a4a2a', '#5a3320', '#3a2218', '#dcb78c'];
 
-        const ui = RRMP.ui = {
-                onlineBtn: null, charBtn: null,
-                statusEl: null,
-                browserTimer: null,
+	const ui = RRMP.ui = {
+		onlineBtn: null, charBtn: null, statusEl: null, debugEl: null, browserTimer: null,
 
-                // Turn a Supabase/PostgREST error into a friendly, actionable message.
-                friendlyError(e)
-                {
-                        const msg = (e && (e.message || e)) || 'Unknown error';
-                        const s = String(msg).toLowerCase();
-                        if (s.indexOf('forbidden') >= 0 && s.indexOf('secret') >= 0)
-                        {
-                                return 'You pasted a SECRET key (sb_secret_… or service_role) into supabase-config.js — that is blocked in browsers. Open Supabase → Settings → API Keys and copy the PUBLISHABLE key (sb_publishable_…), or the legacy "anon" JWT, then paste it into supabase-config.js → anonKey. Run RRMP.diagnose() in the console to verify.';
-                        }
-                        if (s.indexOf('401') >= 0 || s.indexOf('unauthorized') >= 0 || s.indexOf('jwt') >= 0 || s.indexOf('invalid api key') >= 0)
-                        {
-                                return 'Supabase rejected the key (401). Open the browser console and run RRMP.diagnose() — most likely the URL and key are from different Supabase projects, or the key was rotated. Use the PUBLISHABLE key (sb_publishable_…), not the secret one.';
-                        }
-                        if (s.indexOf('403') >= 0 || s.indexOf('forbidden') >= 0 || s.indexOf('policy') >= 0)
-                        {
-                                return 'Supabase blocked the request (403 / RLS). Re-run supabase/schema.sql to make sure the RLS policies are in place.';
-                        }
-                        if (s.indexOf('404') >= 0 || s.indexOf('not found') >= 0 || s.indexOf('does not exist') >= 0)
-                        {
-                                return 'A Supabase table or function is missing. Re-run supabase/schema.sql in the Supabase SQL Editor.';
-                        }
-                        if (s.indexOf('failed to fetch') >= 0 || s.indexOf('network') >= 0)
-                        {
-                                return 'Could not reach Supabase. Check the URL in supabase-config.js and your network.';
-                        }
-                        return 'Error: ' + s;
-                },
+		friendlyError(e)
+		{
+			const s = String((e && (e.message || e)) || 'Unknown error').toLowerCase();
+			if (s.indexOf('secret') >= 0 && s.indexOf('forbidden') >= 0) return 'SECRET key pasted — use the PUBLISHABLE key (sb_publishable_…).';
+			if (s.indexOf('401') >= 0 || s.indexOf('unauthorized') >= 0) return 'Supabase rejected the key (401). Check supabase-config.js URL + key match the same project.';
+			if (s.indexOf('404') >= 0 || s.indexOf('does not exist') >= 0) return 'Table/function missing — re-run supabase/schema.sql.';
+			return 'Error: ' + s;
+		},
 
-                injectStartButtons()
-                {
-                        const menu = $('.rr-menu');
-                        if (!menu || menu.querySelector('[data-rrmp]')) return;
-                        // insert Online + Character right after the Play button
-                        const online = el('button', 'rr-btn rrmp-btn', 'Online');
-                        online.setAttribute('data-act', 'online');
-                        online.setAttribute('data-rrmp', '1');
-                        online.disabled = true;
-                        const char = el('button', 'rr-btn rrmp-btn', 'Character');
-                        char.setAttribute('data-act', 'character');
-                        char.setAttribute('data-rrmp', '1');
-                        const play = menu.querySelector('[data-act="play"]');
-                        if (play && play.nextSibling) { menu.insertBefore(online, play.nextSibling); menu.insertBefore(char, online.nextSibling); }
-                        else { menu.appendChild(online); menu.appendChild(char); }
-                        online.addEventListener('click', (e) => { e.preventDefault(); this.openServers(); });
-                        char.addEventListener('click', (e) => { e.preventDefault(); this.openCharacter(); });
-                        this.onlineBtn = online; this.charBtn = char;
-                },
+		injectStartButtons()
+		{
+			const menu = $('.rr-menu');
+			if (!menu || menu.querySelector('[data-rrmp]')) return;
+			const online = el('button', 'rr-btn rrmp-btn', 'Online');
+			online.setAttribute('data-act', 'online'); online.setAttribute('data-rrmp', '1'); online.disabled = true;
+			const char = el('button', 'rr-btn rrmp-btn', 'Character');
+			char.setAttribute('data-act', 'character'); char.setAttribute('data-rrmp', '1');
+			const play = menu.querySelector('[data-act="play"]');
+			if (play && play.nextSibling) { menu.insertBefore(online, play.nextSibling); menu.insertBefore(char, online.nextSibling); }
+			else { menu.appendChild(online); menu.appendChild(char); }
+			online.addEventListener('click', (e) => { e.preventDefault(); this.openServers(); });
+			char.addEventListener('click', (e) => { e.preventDefault(); this.openCharacter(); });
+			this.onlineBtn = online; this.charBtn = char;
+		},
 
-                // mirror the Play button's enabled state (game loaded)
-                refreshStartButtons()
-                {
-                        const w = RRMP.world; const u = w && w.realismUI;
-                        const loaded = !!(u && u.loaded);
-                        if (this.onlineBtn) this.onlineBtn.disabled = !loaded || !!RRMP.disabled;
-                        if (this.charBtn) this.charBtn.disabled = !!RRMP.disabled;
-                },
+		refreshStartButtons()
+		{
+			const u = RRMP.world && RRMP.world.realismUI;
+			const loaded = !!(u && u.loaded);
+			if (this.onlineBtn) this.onlineBtn.disabled = !loaded || !!RRMP.disabled;
+			if (this.charBtn) this.charBtn.disabled = !!RRMP.disabled;
+		},
 
-                block(on)
-                {
-                        const w = RRMP.world; const u = w && w.realismUI;
-                        if (u && typeof u.setBlocking === 'function') u.setBlocking('multiplayer', !!on);
-                },
+		block(on) { const u = RRMP.world && RRMP.world.realismUI; if (u && u.setBlocking) u.setBlocking('multiplayer', !!on); },
 
-                // ---------- Servers browser ----------
-                openServers()
-                {
-                        if (RRMP.disabled)
-                        {
-                                const reason = RRMP.disabledReason ? ('\n\n' + RRMP.disabledReason) : '';
-                                this.toast('Multiplayer disabled. Check the browser console (F12) for setup steps.' + reason);
-                                return;
-                        }
-                        this.closeModal();
-                        const ov = el('div', 'rrmp-overlay');
-                        const card = el('div', 'rrmp-card');
-                        card.innerHTML =
-                                '<h2>Online — Servers</h2>' +
-                                '<p class="rrmp-sub">Pick a public server to drop into, join a private server with a code, or create your own.</p>' +
-                                '<div class="rrmp-mode-toggle" id="rrmp-mode">' +
-                                        '<button type="button" data-mode="global" class="active">Global</button>' +
-                                        '<button type="button" data-mode="lan">LAN (Direct P2P)</button>' +
-                                '</div>' +
-                                '<div class="rrmp-mode-desc" id="rrmp-mode-desc">Global: all traffic through Supabase. Works across the internet.</div>' +
-                                '<div class="rrmp-row" style="margin:0 0 10px"><input class="rrmp-input" id="rrmp-search" placeholder="Filter servers by name…" /></div>' +
-                                '<div class="rrmp-list" id="rrmp-list"><div class="rrmp-empty"><span class="rrmp-spin"></span> Loading servers…</div></div>' +
-                                '<div class="rrmp-actions">' +
-                                        '<button class="rrmp-btn" id="rrmp-code">Join by Code</button>' +
-                                        '<button class="rrmp-btn rrmp-primary" id="rrmp-create">Create Server</button>' +
-                                        '<button class="rrmp-btn rrmp-ghost" id="rrmp-cancel">Cancel</button>' +
-                                '</div>';
-                        ov.appendChild(card);
-                        document.body.appendChild(ov);
-                        this.currentOverlay = ov;
-                        this.block(true);
+		openServers()
+		{
+			if (RRMP.disabled) { this.toast('Multiplayer disabled: ' + (RRMP.disabledReason || 'check console')); return; }
+			this.closeModal();
+			const ov = el('div', 'rrmp-overlay'); const card = el('div', 'rrmp-card');
+			card.innerHTML =
+				'<h2>Online — Servers</h2>' +
+				'<p class="rrmp-sub">Join a public server, use a code, or create your own.</p>' +
+				'<div class="rrmp-row"><input class="rrmp-input" id="rrmp-search" placeholder="Filter servers by name…" /></div>' +
+				'<div class="rrmp-list" id="rrmp-list"><div class="rrmp-empty"><span class="rrmp-spin"></span> Loading…</div></div>' +
+				'<div class="rrmp-actions"><button class="rrmp-btn" id="rrmp-code">Join by Code</button><button class="rrmp-btn rrmp-primary" id="rrmp-create">Create Server</button><button class="rrmp-btn rrmp-ghost" id="rrmp-cancel">Cancel</button></div>';
+			ov.appendChild(card); document.body.appendChild(ov); this.currentOverlay = ov; this.block(true);
+			const list = $('#rrmp-list', card); const search = $('#rrmp-search', card);
+			let servers = [];
+			const render = () =>
+			{
+				const q = (search.value || '').toLowerCase().trim();
+				const shown = servers.filter((s) => s.is_public && (!q || (s.name || '').toLowerCase().indexOf(q) >= 0));
+				if (!shown.length) { list.innerHTML = '<div class="rrmp-empty">No public servers found.</div>'; return; }
+				list.innerHTML = '';
+				shown.forEach((s) =>
+				{
+					const full = s.player_count >= s.max_players;
+					const row = el('div', 'rrmp-srv');
+					row.innerHTML = '<div class="rrmp-srv-info"><div class="rrmp-srv-name">' + esc(s.name) + (s.is_default ? ' <span class="rrmp-badge">Official</span>' : '') + '</div><div class="rrmp-srv-meta">Max ' + s.max_players + '</div></div><span class="rrmp-srv-count' + (full ? ' full' : '') + '">' + s.player_count + ' / ' + s.max_players + '</span><button class="rrmp-btn rrmp-primary" ' + (full ? 'disabled' : '') + '>' + (full ? 'Full' : 'Join') + '</button>';
+					if (!full) row.querySelector('button').addEventListener('click', (e) => { e.preventDefault(); this.joinServer(s); });
+					list.appendChild(row);
+				});
+			};
+			const refresh = async () => { try { await db.reap(); servers = await db.listServers(); if (this.currentOverlay === ov) render(); } catch (e) { list.innerHTML = '<div class="rrmp-err">' + esc(this.friendlyError(e)) + '</div>'; } };
+			refresh(); this.browserTimer = setInterval(refresh, RRMP.config.browserRefreshSeconds * 1000);
+			search.addEventListener('input', render);
+			$('#rrmp-create', card).addEventListener('click', (e) => { e.preventDefault(); this.openCreate(); });
+			$('#rrmp-code', card).addEventListener('click', (e) => { e.preventDefault(); this.openJoinByCode(); });
+			$('#rrmp-cancel', card).addEventListener('click', (e) => { e.preventDefault(); this.closeModal(); });
+			ov.addEventListener('click', (e) => { if (e.target === ov) this.closeModal(); });
+		},
 
-                        // mode toggle
-                        let selectedMode = 'global';
-                        const modeBar = $('#rrmp-mode', card);
-                        const modeDesc = $('#rrmp-mode-desc', card);
-                        const modeTexts = {
-                                global: 'Global: all traffic through Supabase. Works across the internet.',
-                                lan: 'LAN: position data flows direct peer-to-peer (WebRTC). Supabase is only used to find peers. Lower latency on the same network.',
-                        };
-                        modeBar.querySelectorAll('button').forEach((b) =>
-                        {
-                                b.addEventListener('click', (e) =>
-                                {
-                                        e.preventDefault();
-                                        selectedMode = b.getAttribute('data-mode');
-                                        modeBar.querySelectorAll('button').forEach((x) => x.classList.remove('active'));
-                                        b.classList.add('active');
-                                        modeDesc.textContent = modeTexts[selectedMode] || '';
-                                });
-                        });
-                        // store on the ui object so joinAndClose / openCreate / openJoinByCode can read it
-                        this._selectedMode = () => selectedMode;
+		async joinServer(server)
+		{
+			try
+			{
+				this.closeModal();
+				this.toast('Joining "' + server.name + '"…');
+				session.join(server);
+				maintainSkin();
+			} catch (e) { this.toast('Failed to join: ' + (e.message || e)); warn('join failed', e); }
+		},
 
-                        const list = $('#rrmp-list', card);
-                        const search = $('#rrmp-search', card);
-                        let servers = [];
-                        const render = () =>
-                        {
-                                const q = (search.value || '').toLowerCase().trim();
-                                const shown = servers.filter((s) => s.is_public && (!q || (s.name || '').toLowerCase().indexOf(q) >= 0));
-                                if (!shown.length)
-                                {
-                                        list.innerHTML = '<div class="rrmp-empty">No public servers found.</div>';
-                                        return;
-                                }
-                                list.innerHTML = '';
-                                shown.forEach((s) =>
-                                {
-                                        const full = s.player_count >= s.max_players;
-                                        const row = el('div', 'rrmp-srv');
-                                        row.innerHTML =
-                                                '<div class="rrmp-srv-info">' +
-                                                        '<div class="rrmp-srv-name">' + esc(s.name) + (s.is_default ? ' <span class="rrmp-badge">Official</span>' : '') + '</div>' +
-                                                        '<div class="rrmp-srv-meta">Max ' + s.max_players + ' players</div>' +
-                                                '</div>' +
-                                                '<span class="rrmp-srv-count' + (full ? ' full' : '') + '">' + s.player_count + ' / ' + s.max_players + '</span>' +
-                                                '<button class="rrmp-btn rrmp-primary" ' + (full ? 'disabled' : '') + '>' + (full ? 'Full' : 'Join') + '</button>';
-                                        const btn = row.querySelector('button');
-                                        if (!full) btn.addEventListener('click', (e) => { e.preventDefault(); this.joinAndClose(s); });
-                                        list.appendChild(row);
-                                });
-                        };
+		openCreate()
+		{
+			this.closeModal();
+			const ov = el('div', 'rrmp-overlay'); const card = el('div', 'rrmp-card');
+			card.innerHTML = '<h2>Create a Server</h2><p class="rrmp-sub">Public = free join. Private = code required.</p><div class="rrmp-row"><label>Server name</label><input class="rrmp-input" id="rrmp-name" maxlength="40" placeholder="My Hood" /></div><div class="rrmp-row"><label>Type</label><select class="rrmp-select" id="rrmp-type"><option value="public">Public (free join)</option><option value="private">Private (code required)</option></select></div><div class="rrmp-row" id="rrmp-code-row" style="display:none"><label>Join code</label><input class="rrmp-input" id="rrmp-code" maxlength="6" style="text-transform:uppercase" /><button class="rrmp-btn" id="rrmp-gencode" type="button">Generate</button></div><div class="rrmp-row"><label>Max players</label><input class="rrmp-input" id="rrmp-max" type="number" min="1" max="64" value="16" /></div><div class="rrmp-err" id="rrmp-err" style="display:none"></div><div class="rrmp-actions"><button class="rrmp-btn rrmp-ghost" id="rrmp-back">Back</button><button class="rrmp-btn rrmp-primary" id="rrmp-go">Create &amp; Join</button></div>';
+			ov.appendChild(card); document.body.appendChild(ov); this.currentOverlay = ov;
+			const typeSel = $('#rrmp-type', card); const codeRow = $('#rrmp-code-row', card);
+			typeSel.addEventListener('change', () => { codeRow.style.display = typeSel.value === 'private' ? '' : 'none'; });
+			$('#rrmp-gencode', card).addEventListener('click', () => { $('#rrmp-code', card).value = genCode(); });
+			$('#rrmp-back', card).addEventListener('click', (e) => { e.preventDefault(); this.openServers(); });
+			$('#rrmp-go', card).addEventListener('click', async (e) =>
+			{
+				e.preventDefault();
+				const err = $('#rrmp-err', card); err.style.display = 'none';
+				const name = $('#rrmp-name', card).value.trim();
+				const isPublic = typeSel.value === 'public';
+				const code = $('#rrmp-code', card).value.trim().toUpperCase();
+				const max = parseInt($('#rrmp-max', card).value, 10) || 16;
+				if (!name) { err.textContent = 'Enter a server name.'; err.style.display = ''; return; }
+				if (!isPublic && code.length < 4) { err.textContent = 'Private servers need a code (4+ characters).'; err.style.display = ''; return; }
+				try
+				{
+					$('#rrmp-go', card).disabled = true;
+					const srv = await db.createServer(name, isPublic, code, max);
+					this.closeModal();
+					this.toast('Created "' + srv.name + '"' + (srv.join_code ? ' • code ' + srv.join_code : ''));
+					session.join(srv);
+					maintainSkin();
+				} catch (e2) { err.textContent = this.friendlyError(e2); err.style.display = ''; $('#rrmp-go', card).disabled = false; }
+			});
+		},
 
-                        const refresh = async () =>
-                        {
-                                try
-                                {
-                                        await db.reap();
-                                        servers = await db.listServers();
-                                        if (this.currentOverlay === ov) render();
-                                } catch (e)
-                                {
-                                        list.innerHTML = '<div class="rrmp-err">' + esc(this.friendlyError(e)) + '</div>';
-                                }
-                        };
-                        refresh();
-                        this.browserTimer = setInterval(refresh, RRMP.config.browserRefreshSeconds * 1000);
-                        search.addEventListener('input', render);
-                        $('#rrmp-create', card).addEventListener('click', (e) => { e.preventDefault(); this.openCreate(); });
-                        $('#rrmp-code', card).addEventListener('click', (e) => { e.preventDefault(); this.openJoinByCode(); });
-                        $('#rrmp-cancel', card).addEventListener('click', (e) => { e.preventDefault(); this.closeModal(); });
-                        ov.addEventListener('click', (e) => { if (e.target === ov) this.closeModal(); });
-                },
+		openJoinByCode()
+		{
+			this.closeModal();
+			const ov = el('div', 'rrmp-overlay'); const card = el('div', 'rrmp-card');
+			card.innerHTML = '<h2>Join by Code</h2><p class="rrmp-sub">Enter the code the server owner shared with you.</p><div class="rrmp-row"><label>Code</label><input class="rrmp-input" id="rrmp-code" maxlength="6" style="text-transform:uppercase" placeholder="ABC123" /></div><div class="rrmp-err" id="rrmp-err" style="display:none"></div><div class="rrmp-actions"><button class="rrmp-btn rrmp-ghost" id="rrmp-back">Back</button><button class="rrmp-btn rrmp-primary" id="rrmp-go">Join</button></div>';
+			ov.appendChild(card); document.body.appendChild(ov); this.currentOverlay = ov;
+			$('#rrmp-back', card).addEventListener('click', (e) => { e.preventDefault(); this.openServers(); });
+			$('#rrmp-go', card).addEventListener('click', async (e) =>
+			{
+				e.preventDefault();
+				const err = $('#rrmp-err', card); err.style.display = 'none';
+				const code = $('#rrmp-code', card).value.trim().toUpperCase();
+				if (code.length < 4) { err.textContent = 'Enter the code.'; err.style.display = ''; return; }
+				try
+				{
+					$('#rrmp-go', card).disabled = true;
+					const srv = await db.getByCode(code);
+					if (!srv) { err.textContent = 'No server with that code.'; err.style.display = ''; $('#rrmp-go', card).disabled = false; return; }
+					if (srv.player_count >= srv.max_players) { err.textContent = 'That server is full.'; err.style.display = ''; $('#rrmp-go', card).disabled = false; return; }
+					this.closeModal();
+					this.toast('Joining "' + srv.name + '"…');
+					session.join(srv);
+					maintainSkin();
+				} catch (e2) { err.textContent = this.friendlyError(e2); err.style.display = ''; $('#rrmp-go', card).disabled = false; }
+			});
+		},
 
-                async joinAndClose(server)
-                {
-                        try
-                        {
-                                const mode = (this._selectedMode && this._selectedMode()) || 'global';
-                                this.closeModal();
-                                this.toast('Joining "' + server.name + '"' + (mode === 'lan' ? ' (LAN mode)' : '') + '…');
-                                await session.join(server, mode);
-                                maintainSkin();
-                        } catch (e)
-                        {
-                                this.toast('Failed to join: ' + (e.message || e));
-                                warn('join failed', e);
-                        }
-                },
+		openCharacter()
+		{
+			this.closeModal();
+			const ov = el('div', 'rrmp-overlay'); const card = el('div', 'rrmp-card');
+			card.innerHTML = '<h2>Your Character</h2><p class="rrmp-sub">Used in Free Roam and Online. Saved on this browser.</p><div class="rrmp-row"><label>Name</label><input class="rrmp-input" id="rrmp-name" maxlength="16" value="' + esc(identity.name) + '" /></div><div class="rrmp-row"><label>Gender</label><select class="rrmp-input" id="rrmp-gender"><option value="male">Male</option><option value="female">Female</option></select></div><div class="rrmp-row"><label>Skin color</label><input class="rrmp-input" id="rrmp-color" type="color" value="' + esc(identity.skinColor) + '" style="flex:0 0 60px;height:38px;padding:2px" /></div><div class="rrmp-swatches" id="rrmp-swatches"></div><div class="rrmp-preview" id="rrmp-preview" style="background:' + esc(identity.skinColor) + '"></div><div class="rrmp-actions"><button class="rrmp-btn rrmp-ghost" id="rrmp-cancel">Cancel</button><button class="rrmp-btn rrmp-primary" id="rrmp-save">Save</button></div>';
+			ov.appendChild(card); document.body.appendChild(ov); this.currentOverlay = ov; this.block(true);
+			const colorIn = $('#rrmp-color', card); const nameIn = $('#rrmp-name', card); const genderIn = $('#rrmp-gender', card); const preview = $('#rrmp-preview', card); const sw = $('#rrmp-swatches', card);
+			genderIn.value = identity.gender;
+			SKIN_PRESETS.forEach((c) =>
+			{
+				const s = el('div', 'rrmp-sw' + (c.toLowerCase() === identity.skinColor.toLowerCase() ? ' sel' : ''));
+				s.style.background = c;
+				s.addEventListener('click', () => { colorIn.value = c; preview.style.background = c; sw.querySelectorAll('.rrmp-sw').forEach((x) => x.classList.remove('sel')); s.classList.add('sel'); });
+				sw.appendChild(s);
+			});
+			colorIn.addEventListener('input', () => { preview.style.background = colorIn.value; sw.querySelectorAll('.rrmp-sw').forEach((x) => x.classList.remove('sel')); });
+			$('#rrmp-cancel', card).addEventListener('click', (e) => { e.preventDefault(); this.closeModal(); });
+			$('#rrmp-save', card).addEventListener('click', (e) => { e.preventDefault(); identity.save(nameIn.value, colorIn.value, genderIn.value); maintainSkin(); this.closeModal(); this.toast('Character saved'); });
+		},
 
-                // ---------- Create server ----------
-                openCreate()
-                {
-                        this.closeModal();
-                        const ov = el('div', 'rrmp-overlay');
-                        const card = el('div', 'rrmp-card');
-                        card.innerHTML =
-                                '<h2>Create a Server</h2>' +
-                                '<p class="rrmp-sub">Public servers appear in the browser for anyone. Private servers need a 6-character code to join.</p>' +
-                                '<div class="rrmp-row"><label>Server name</label><input class="rrmp-input" id="rrmp-name" maxlength="40" placeholder="My Hood" /></div>' +
-                                '<div class="rrmp-row"><label>Type</label><select class="rrmp-select" id="rrmp-type"><option value="public">Public (free join)</option><option value="private">Private (code required)</option></select></div>' +
-                                '<div class="rrmp-row" id="rrmp-code-row" style="display:none"><label>Join code</label><input class="rrmp-input" id="rrmp-code" maxlength="6" style="text-transform:uppercase" /><button class="rrmp-btn" id="rrmp-gencode" type="button">Generate</button></div>' +
-                                '<div class="rrmp-row"><label>Max players</label><input class="rrmp-input" id="rrmp-max" type="number" min="1" max="64" value="16" /></div>' +
-                                '<div class="rrmp-err" id="rrmp-err" style="display:none"></div>' +
-                                '<div class="rrmp-actions"><button class="rrmp-btn rrmp-ghost" id="rrmp-back">Back</button><button class="rrmp-btn rrmp-primary" id="rrmp-go">Create &amp; Join</button></div>';
-                        ov.appendChild(card); document.body.appendChild(ov); this.currentOverlay = ov;
+		showStatus(server)
+		{
+			this.hideStatus();
+			const s = el('div', 'rrmp-status');
+			s.innerHTML = '<span class="rrmp-dot" id="rrmp-dot"></span><span>' + esc(server.name) + '</span> • <span id="rrmp-stcount">1</span> online • <span id="rrmp-health">HP 100</span> • <span id="rrmp-kd">0 K / 0 D</span><button class="rrmp-btn rrmp-danger" id="rrmp-leave" style="margin-left:6px;padding:4px 10px">Leave</button>';
+			document.body.appendChild(s); this.statusEl = s;
+			$('#rrmp-leave', s).addEventListener('click', async (e) => { e.preventDefault(); session.leave(); this.toast('Left the server'); });
+			this.updateHealth();
+		},
+		updateStatusCount(n)
+		{
+			if (!this.statusEl) return;
+			const c = $('#rrmp-stcount', this.statusEl); if (c) c.textContent = String(n);
+			const dot = $('#rrmp-dot', this.statusEl);
+			if (dot) dot.className = 'rrmp-dot' + (RRMP.stats.channelStatus === 'SUBSCRIBED' ? '' : ' warn');
+		},
+		updateHealth()
+		{
+			if (!this.statusEl) return;
+			const health = $('#rrmp-health', this.statusEl);
+			const kd = $('#rrmp-kd', this.statusEl);
+			if (health) health.textContent = 'HP ' + Math.ceil(RRMP.combat.health);
+			if (kd) kd.textContent = RRMP.combat.kills + ' K / ' + RRMP.combat.deaths + ' D';
+		},
+		hideStatus() { if (this.statusEl) { this.statusEl.remove(); this.statusEl = null; } },
 
-                        const typeSel = $('#rrmp-type', card);
-                        const codeRow = $('#rrmp-code-row', card);
-                        typeSel.addEventListener('change', () => { codeRow.style.display = typeSel.value === 'private' ? '' : 'none'; });
-                        $('#rrmp-gencode', card).addEventListener('click', () => { $('#rrmp-code', card).value = genCode(); });
-                        $('#rrmp-back', card).addEventListener('click', (e) => { e.preventDefault(); this.openServers(); });
-                        $('#rrmp-go', card).addEventListener('click', async (e) =>
-                        {
-                                e.preventDefault();
-                                const err = $('#rrmp-err', card); err.style.display = 'none';
-                                const name = $('#rrmp-name', card).value.trim();
-                                const isPublic = typeSel.value === 'public';
-                                const code = $('#rrmp-code', card).value.trim().toUpperCase();
-                                const max = parseInt($('#rrmp-max', card).value, 10) || 16;
-                                if (!name) { err.textContent = 'Enter a server name.'; err.style.display = ''; return; }
-                                if (!isPublic && code.length < 4) { err.textContent = 'Private servers need a code (at least 4 characters).'; err.style.display = ''; return; }
-                                try
-                                {
-                                        $('#rrmp-go', card).disabled = true;
-                                        const srv = await db.createServer(name, isPublic, code, max, 1337);
-                                        this.closeModal();
-                                        this.toast('Created "' + srv.name + '"' + (srv.join_code ? ' • code ' + srv.join_code : ''));
-                                        const mode = (this._selectedMode && this._selectedMode()) || 'global';
-                                        await session.join(srv, mode);
-                                        maintainSkin();
-                                } catch (e2)
-                                {
-                                        err.textContent = this.friendlyError(e2).replace(/^Could not load servers:/, 'Could not create server:');
-                                        err.style.display = '';
-                                        $('#rrmp-go', card).disabled = false;
-                                }
-                        });
-                },
+		showDebug()
+		{
+			this.hideDebug();
+			const d = el('div', 'rrmp-debug');
+			d.innerHTML = '<b>RRMP</b> <span id="rrmp-dbg-status">…</span> | online: <span id="rrmp-dbg-pres">0</span> | sent: <span id="rrmp-dbg-sent">0</span> | recv: <span id="rrmp-dbg-recv">0</span> | players: <span id="rrmp-dbg-players">0</span>';
+			document.body.appendChild(d); this.debugEl = d;
+		},
+		updateDebug()
+		{
+			if (!this.debugEl) return;
+			const set = (id, v, cls) => { const e = $('#' + id, this.debugEl); if (e) { e.textContent = String(v); if (cls !== undefined) e.className = cls; } };
+			const st = RRMP.stats.channelStatus || '…';
+			set('rrmp-dbg-status', st, st === 'SUBSCRIBED' ? 'ok' : (st === 'CHANNEL_ERROR' || st === 'TIMED_OUT' || st === 'CLOSED' ? 'err' : 'warn'));
+			set('rrmp-dbg-pres', RRMP.stats.presenceCount);
+			set('rrmp-dbg-sent', RRMP.stats.sent);
+			set('rrmp-dbg-recv', RRMP.stats.recv);
+			set('rrmp-dbg-players', Object.keys(remotePlayers).length);
+		},
+		hideDebug() { if (this.debugEl) { this.debugEl.remove(); this.debugEl = null; } },
 
-                // ---------- Join by code ----------
-                openJoinByCode()
-                {
-                        this.closeModal();
-                        const ov = el('div', 'rrmp-overlay');
-                        const card = el('div', 'rrmp-card');
-                        card.innerHTML =
-                                '<h2>Join by Code</h2>' +
-                                '<p class="rrmp-sub">Enter the 6-character code the server owner shared with you.</p>' +
-                                '<div class="rrmp-row"><label>Code</label><input class="rrmp-input" id="rrmp-code" maxlength="6" style="text-transform:uppercase" placeholder="ABC123" /></div>' +
-                                '<div class="rrmp-err" id="rrmp-err" style="display:none"></div>' +
-                                '<div class="rrmp-actions"><button class="rrmp-btn rrmp-ghost" id="rrmp-back">Back</button><button class="rrmp-btn rrmp-primary" id="rrmp-go">Join</button></div>';
-                        ov.appendChild(card); document.body.appendChild(ov); this.currentOverlay = ov;
-                        $('#rrmp-back', card).addEventListener('click', (e) => { e.preventDefault(); this.openServers(); });
-                        $('#rrmp-go', card).addEventListener('click', async (e) =>
-                        {
-                                e.preventDefault();
-                                const err = $('#rrmp-err', card); err.style.display = 'none';
-                                const code = $('#rrmp-code', card).value.trim().toUpperCase();
-                                if (code.length < 4) { err.textContent = 'Enter the code the owner gave you.'; err.style.display = ''; return; }
-                                try
-                                {
-                                        $('#rrmp-go', card).disabled = true;
-                                        const srv = await db.getByCode(code);
-                                        if (!srv) { err.textContent = 'No server with that code.'; err.style.display = ''; $('#rrmp-go', card).disabled = false; return; }
-                                        if (srv.player_count >= srv.max_players) { err.textContent = 'That server is full.'; err.style.display = ''; $('#rrmp-go', card).disabled = false; return; }
-                                        this.closeModal();
-                                        const mode = (this._selectedMode && this._selectedMode()) || 'global';
-                                        this.toast('Joining "' + srv.name + '"' + (mode === 'lan' ? ' (LAN mode)' : '') + '…');
-                                        await session.join(srv, mode);
-                                        maintainSkin();
-                                } catch (e2)
-                                {
-                                        err.textContent = this.friendlyError(e2).replace(/^Could not load servers:/, 'Could not join:');
-                                        err.style.display = '';
-                                        $('#rrmp-go', card).disabled = false;
-                                }
-                        });
-                },
+		closeModal() { if (this.browserTimer) { clearInterval(this.browserTimer); this.browserTimer = null; } if (this.currentOverlay) { this.currentOverlay.remove(); this.currentOverlay = null; } this.block(false); },
+		toast(msg) { const t = el('div', 'rrmp-status'); t.style.borderRadius = '8px'; t.innerHTML = '<span style="color:#ffd27a">' + esc(msg) + '</span>'; document.body.appendChild(t); setTimeout(() => t.remove(), 2600); },
+	};
 
-                // ---------- Character creator ----------
-                openCharacter()
-                {
-                        this.closeModal();
-                        const ov = el('div', 'rrmp-overlay');
-                        const card = el('div', 'rrmp-card');
-                        card.innerHTML =
-                                '<h2>Your Character</h2>' +
-                                '<p class="rrmp-sub">Your name and skin are used in both Free Roam and Online. Saved on this browser.</p>' +
-                                '<div class="rrmp-row"><label>Name</label><input class="rrmp-input" id="rrmp-name" maxlength="16" placeholder="Player" value="' + esc(identity.name) + '" /></div>' +
-                                '<div class="rrmp-row"><label>Skin color</label><input class="rrmp-input" id="rrmp-color" type="color" value="' + esc(identity.skinColor) + '" style="flex:0 0 60px;height:38px;padding:2px" /></div>' +
-                                '<div class="rrmp-swatches" id="rrmp-swatches"></div>' +
-                                '<div class="rrmp-preview" id="rrmp-preview" style="background:' + esc(identity.skinColor) + '"></div>' +
-                                '<div class="rrmp-hint">Tip: pick a preset or use the color picker for any shade.</div>' +
-                                '<div class="rrmp-actions"><button class="rrmp-btn rrmp-ghost" id="rrmp-cancel">Cancel</button><button class="rrmp-btn rrmp-primary" id="rrmp-save">Save</button></div>';
-                        ov.appendChild(card); document.body.appendChild(ov); this.currentOverlay = ov; this.block(true);
+	// ======================================================================
+	//  Frame loop — movement broadcast + avatar lerp + skin
+	// ======================================================================
+	let _lastFrame = performance.now();
+	function frameLoop()
+	{
+		requestAnimationFrame(frameLoop);
+		const now = performance.now();
+		let dt = (now - _lastFrame) / 1000; _lastFrame = now;
+		if (dt > 0.1) dt = 0.1;
+		try { session.tick(); } catch (e) { /* ignore */ }
+		try { session.lerpAvatars(dt); } catch (e) { /* ignore */ }
+		try { maintainSkin(); } catch (e) { /* ignore */ }
+		try { ui.refreshStartButtons(); } catch (e) { /* ignore */ }
+		try { ui.updateDebug(); } catch (e) { /* ignore */ }
+	}
 
-                        const colorIn = $('#rrmp-color', card);
-                        const nameIn = $('#rrmp-name', card);
-                        const preview = $('#rrmp-preview', card);
-                        const sw = $('#rrmp-swatches', card);
-                        SKIN_PRESETS.forEach((c) =>
-                        {
-                                const s = el('div', 'rrmp-sw' + (c.toLowerCase() === identity.skinColor.toLowerCase() ? ' sel' : ''));
-                                s.style.background = c; s.title = c;
-                                s.addEventListener('click', () =>
-                                {
-                                        colorIn.value = c; preview.style.background = c;
-                                        sw.querySelectorAll('.rrmp-sw').forEach((x) => x.classList.remove('sel'));
-                                        s.classList.add('sel');
-                                });
-                                sw.appendChild(s);
-                        });
-                        colorIn.addEventListener('input', () =>
-                        {
-                                preview.style.background = colorIn.value;
-                                sw.querySelectorAll('.rrmp-sw').forEach((x) => x.classList.remove('sel'));
-                        });
-                        $('#rrmp-cancel', card).addEventListener('click', (e) => { e.preventDefault(); this.closeModal(); });
-                        $('#rrmp-save', card).addEventListener('click', (e) =>
-                        {
-                                e.preventDefault();
-                                identity.saveCharacter(nameIn.value, colorIn.value);
-                                maintainSkin();
-                                // push updated name/skin to the live session + presence
-                                if (session.server && session.connId)
-                                {
-                                        db.heartbeat(session.server.id, session.connId).catch(() => { /* non-fatal */ });
-                                        if (session.channel) session.channel.track({ id: session.connId, playerId: identity.id, name: identity.name, skinColor: identity.skinColor });
-                                }
-                                this.closeModal();
-                                this.toast('Character saved');
-                        });
-                },
+	// ======================================================================
+	//  Bootstrap
+	// ======================================================================
+	function bootstrap()
+	{
+		identity.load();
+		injectCSS();
+		const ok = initConfig();
+		let wired = false;
+		const tryWire = () =>
+		{
+			const w = window.realismWorld;
+			if (!w) return;
+			RRMP.world = w;
+			const menu = $('.rr-menu');
+			if (menu && !wired) { wired = true; ui.injectStartButtons(); log('wired into start screen'); }
+			ui.refreshStartButtons();
+		};
+		tryWire();
+		setInterval(tryWire, 500);
+		if (ok) frameLoop();
+		else
+		{
+			requestAnimationFrame(function skinLoop() { requestAnimationFrame(skinLoop); try { maintainSkin(); } catch (e) { /* ignore */ } });
+		}
+		log('boot done. enabled=' + ok + '. Debug: RRMP.debug()');
+	}
 
-                // ---------- status HUD ----------
-                showStatus(server, mode)
-                {
-                        this.hideStatus();
-                        const s = el('div', 'rrmp-status');
-                        const modeLabel = mode === 'lan' ? ' <span style="color:#9fc0ff;font-size:11px">LAN</span>' : '';
-                        s.innerHTML = '<span class="rrmp-dot"></span><span id="rrmp-stname">' + esc(server.name) + '</span>' + modeLabel + ' • <span id="rrmp-stcount">1</span> online <button class="rrmp-btn rrmp-danger" id="rrmp-leave" style="margin-left:6px;padding:4px 10px">Leave</button>';
-                        document.body.appendChild(s);
-                        this.statusEl = s;
-                        $('#rrmp-leave', s).addEventListener('click', async (e) =>
-                        {
-                                e.preventDefault();
-                                await session.leave();
-                                this.toast('Left the server');
-                        });
-                },
-                updateStatusCount(n)
-                {
-                        if (this.statusEl) { const c = $('#rrmp-stcount', this.statusEl); if (c) c.textContent = String(n); }
-                },
-                hideStatus() { if (this.statusEl) { this.statusEl.remove(); this.statusEl = null; } },
-
-                // ---------- modal + toast helpers ----------
-                closeModal()
-                {
-                        if (this.browserTimer) { clearInterval(this.browserTimer); this.browserTimer = null; }
-                        if (this.currentOverlay) { this.currentOverlay.remove(); this.currentOverlay = null; }
-                        this.block(false);
-                },
-                toast(msg)
-                {
-                        const t = el('div', 'rrmp-status');
-                        t.style.borderRadius = '8px';
-                        t.innerHTML = '<span style="color:#ffd27a">' + esc(msg) + '</span>';
-                        document.body.appendChild(t);
-                        setTimeout(() => t.remove(), 2600);
-                },
-        };
-
-        // ======================================================================
-        //  Per-frame loop (avatar lerp + skin maintenance) — independent of game timeScale
-        // ======================================================================
-        let _lastFrame = now();
-        function frameLoop()
-        {
-                requestAnimationFrame(frameLoop);
-                const t = now();
-                let dt = (t - _lastFrame) / 1000; _lastFrame = t;
-                if (dt > 0.1) dt = 0.1;        // clamp after tab switch
-                try { avatars.tick(dt); } catch (e) { /* ignore */ }
-                try { maintainSkin(); } catch (e) { /* ignore */ }
-                try { ui.refreshStartButtons(); } catch (e) { /* ignore */ }
-        }
-
-        // ======================================================================
-        //  Bootstrap: wait for the world + start screen, then wire everything
-        // ======================================================================
-        function bootstrap()
-        {
-                identity.load();
-                injectCSS();
-                const ok = initConfig();
-
-                let wired = false;
-                const tryWire = () =>
-                {
-                        const w = window.realismWorld;
-                        if (!w) return;
-                        RRMP.world = w;
-                        const menu = $('.rr-menu');
-                        if (menu && !wired)
-                        {
-                                wired = true;
-                                ui.injectStartButtons();
-                                log('wired into start screen');
-                        }
-                        ui.refreshStartButtons();
-                };
-                tryWire();
-                setInterval(tryWire, 500);
-
-                if (ok) frameLoop();
-                else
-                {
-                        // even when disabled, still show a disabled Online button + re-apply skin for Free Roam
-                        setInterval(() => { try { maintainSkin(); } catch (e) { /* ignore */ } ui.refreshStartButtons(); }, 800);
-                        // keep a minimal frame loop for skin only
-                        requestAnimationFrame(function skinLoop() { requestAnimationFrame(skinLoop); try { maintainSkin(); } catch (e) { /* ignore */ } });
-                }
-                log('bootstrap done, enabled=' + ok);
-        }
-
-        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootstrap);
-        else bootstrap();
+	if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bootstrap);
+	else bootstrap();
 })();

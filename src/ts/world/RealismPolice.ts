@@ -26,6 +26,7 @@ import * as THREE from 'three';
 import { RealismCtx } from './RealismContext';
 import { Car } from '../vehicles/Car';
 import { loadSharedModel } from './RealismNPCs';
+import { loadGLB } from './RealismAssets';
 import { ensurePaint, setTwoTone, VehicleTuning } from './RealismVehicleTuning';
 import { ELSSystem, LED_COUNT, QuadBuilder, CarLayout, barLayout, ATLAS_W, ATLAS_H } from './RealismELS';
 
@@ -40,6 +41,7 @@ export interface PoliceSettings
 	pushBar: boolean;
 	lightColors: { left: number[]; right: number[] };
 	sheriff: { color: number[]; twoTone: boolean; upper: number[]; lower: number[]; split: number; unitPrefix: string; firstUnit: number; pushBar: boolean };
+	mdtLaptop: { model: string; position: number[]; rotation: number[]; scale: number | number[] };
 	els: any;
 }
 
@@ -53,6 +55,7 @@ export const POLICE_DEFAULTS: PoliceSettings = {
 	pushBar: true,
 	lightColors: { left: [1, 0.06, 0.04], right: [0.12, 0.3, 1] },
 	sheriff: { color: [0.035, 0.035, 0.04], twoTone: false, upper: [0.86, 0.79, 0.62], lower: [0.13, 0.27, 0.17], split: 0.22, unitPrefix: 'S', firstUnit: 21, pushBar: true },
+	mdtLaptop: { model: '', position: [0, 0.62, 0.62], rotation: [0, 180, 0], scale: 0.72 },
 	els: {},
 };
 
@@ -376,6 +379,7 @@ export class PoliceSystem
 		this.tuning.apply(car, { rgb: base, finish: S.finish || 'gloss', rgb2: twoTone ? sh.lower : null, split: sh.split });
 		if (paint && !twoTone) setTwoTone(paint, car, null, 0);
 		car.realismPolice = { dept: d, unit: unit, meshes: [] as THREE.Object3D[] };
+		this.ensureMdtLaptop(car);
 		// decals on the doors
 		const meshes: THREE.Object3D[] = car.realismPolice.meshes;
 		car.updateMatrixWorld(true);
@@ -411,6 +415,65 @@ export class PoliceSystem
 		for (let i = 0; i < led.length; i++) { led[i].userData.realismLivery = true; car.add(led[i]); meshes.push(led[i]); }
 		if (this.cars.indexOf(car) < 0) this.cars.push(car);
 		this.stats.units = this.cars.length;
+	}
+
+	private ensureMdtLaptop(car: any): void
+	{
+		const police = car && car.realismPolice;
+		if (!police || police.mdtLaptop) return;
+		const settings = this.settings.mdtLaptop;
+		const group = new THREE.Group();
+		group.name = 'policeMdtLaptop';
+		const position = settings && settings.position;
+		const rotation = settings && settings.rotation;
+		const scale = settings && settings.scale;
+		const finite = (value: any, fallback: number): number =>
+			typeof value === 'number' && isFinite(value) ? value : fallback;
+		group.position.set(
+			finite(position && position[0], 0),
+			finite(position && position[1], 0.62),
+			finite(position && position[2], 0.62));
+		group.rotation.set(
+			finite(rotation && rotation[0], 0) * Math.PI / 180,
+			finite(rotation && rotation[1], 180) * Math.PI / 180,
+			finite(rotation && rotation[2], 0) * Math.PI / 180);
+		if (Array.isArray(scale))
+		{
+			group.scale.set(
+				Math.max(0.01, finite(scale[0], 0.72)),
+				Math.max(0.01, finite(scale[1], 0.72)),
+				Math.max(0.01, finite(scale[2], 0.72)));
+		}
+		else
+		{
+			const uniform = typeof scale === 'number' && isFinite(scale) && scale > 0 ? scale : 0.72;
+			group.scale.setScalar(uniform);
+		}
+		car.add(group);
+		police.mdtLaptop = group;
+		police.meshes.push(group);
+
+		const model = settings && typeof settings.model === 'string' ? settings.model.trim() : '';
+		if (!model) { this.addMdtLaptopFallback(group); return; }
+		loadGLB(model, (scene: THREE.Object3D) =>
+		{
+			if (!car.realismPolice || car.realismPolice.meshes.indexOf(group) < 0) return;
+			while (group.children.length) group.remove(group.children[0]);
+			group.add(scene.clone(true));
+		}, () => this.addMdtLaptopFallback(group));
+	}
+
+	private addMdtLaptopFallback(group: THREE.Group): void
+	{
+		const frame = new THREE.MeshLambertMaterial({ color: 0x171a1e });
+		const screen = new THREE.MeshLambertMaterial({ color: 0x17324a, emissive: 0x07121d, side: THREE.DoubleSide });
+		const base = new THREE.Mesh(new THREE.BoxBufferGeometry(0.38, 0.025, 0.27), frame);
+		base.position.set(0, 0.015, 0);
+		const lid = new THREE.Mesh(new THREE.BoxBufferGeometry(0.38, 0.24, 0.018), frame);
+		lid.position.set(0, 0.135, -0.12);
+		const display = new THREE.Mesh(new THREE.BoxBufferGeometry(0.34, 0.195, 0.003), screen);
+		display.position.set(0, 0.135, -0.109);
+		group.add(base, lid, display);
 	}
 
 	private detachMeshes(car: any): void

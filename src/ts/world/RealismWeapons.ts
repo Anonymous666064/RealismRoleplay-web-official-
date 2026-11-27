@@ -84,7 +84,7 @@ export const DEFAULT_WEAPONS: any = {
 	aimDistance: 1.05,         // camera distance while aiming (normal is 1.6)
 	shoulder: [0.42, 0.16],    // camera offset while aiming: right, up (metres)
 	fists:   { kind: 'fists',   name: 'Fists',   damage: 12, fireRate: 130, auto: false, magazine: 0,  reserve: 0,   reloadTime: 0,   spread: 0,   aimSpread: 0,   range: 1.4, recoil: 0,   pellets: 1, impulse: 30,  flashSize: 0 },
-	pistol:  { kind: 'pistol',  name: 'Pistol',  damage: 26, fireRate: 360, auto: false, magazine: 12, reserve: 72,  reloadTime: 1.4, spread: 2.2, aimSpread: 0.6, range: 90,  recoil: 2.2, pellets: 1, impulse: 60,  flashSize: 0.13 },
+	pistol:  { kind: 'pistol',  name: 'Service Pistol (Glock 19)', damage: 26, fireRate: 360, auto: false, magazine: 15, reserve: 90,  reloadTime: 1.4, spread: 2.2, aimSpread: 0.6, range: 90,  recoil: 2.2, pellets: 1, impulse: 60,  flashSize: 0.13 },
 	smg:     { kind: 'smg',     name: 'SMG',     damage: 17, fireRate: 850, auto: true,  magazine: 30, reserve: 180, reloadTime: 1.8, spread: 3.5, aimSpread: 1.3, range: 70,  recoil: 1.1, pellets: 1, impulse: 40,  flashSize: 0.14 },
 	shotgun: { kind: 'shotgun', name: 'Shotgun', damage: 14, fireRate: 70,  auto: false, magazine: 6,  reserve: 36,  reloadTime: 2.6, spread: 6.5, aimSpread: 4.5, range: 35,  recoil: 5.5, pellets: 8, impulse: 35,  flashSize: 0.24 },
 	rifle:   { kind: 'rifle',   name: 'Rifle',   damage: 34, fireRate: 600, auto: true,  magazine: 30, reserve: 180, reloadTime: 2.2, spread: 2.8, aimSpread: 0.35, range: 220, recoil: 1.6, pellets: 1, impulse: 90,  flashSize: 0.18 },
@@ -421,6 +421,8 @@ export class WeaponSystem implements IUpdatable
 			if (n >= 0 && n < this.defs.length) { if (this.activePlayer() !== null) this.equip(n); return; }
 			if (code === 'KeyR' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey)
 			{
+				const law: any = this.world.realismLawEnforcement;
+				if (law && typeof law.usesVehicleRadioKey === 'function' && law.usesVehicleRadioKey()) return;
 				if (this.activePlayer() !== null) this.startReload();
 			}
 		}, true);
@@ -653,10 +655,17 @@ export class WeaponSystem implements IUpdatable
 
 		this.tracerCount = 0;
 		const muzzle = this.muzzleWorld();
+		const combatShots: any[] = [];
 		for (let k = 0; k < d.pellets; k++)
 		{
 			const dir = this.v3.copy(this.camDir);
 			if (spreadDeg > 0) coneJitter(dir, spreadDeg * DEG, this.q1);
+			combatShots.push({
+				origin: { x: origin.x, y: origin.y, z: origin.z },
+				direction: { x: dir.x, y: dir.y, z: dir.z },
+				range: Math.max(1, Number(d.range) || 50),
+				damage: Number(d.damage) || 0,
+			});
 			const end = this.shootRay(origin, dir, d);
 			if (this.tracer !== null && this.tracerCount < MAX_TRACERS && (k === 0 || d.pellets <= MAX_TRACERS))
 			{
@@ -667,6 +676,7 @@ export class WeaponSystem implements IUpdatable
 				this.tracerCount++;
 			}
 		}
+		this.broadcastCombatShots(combatShots);
 		if (this.tracer !== null && this.tracerCount > 0)
 		{
 			const attr = (this.tracer.geometry as THREE.BufferGeometry).getAttribute('position') as THREE.BufferAttribute;
@@ -780,15 +790,16 @@ export class WeaponSystem implements IUpdatable
 		this.hipTimer = 0.45;
 		const npcs = this.world.realismNPCs;
 		let hit = false;
+		const cam = this.world.camera;
+		cam.getWorldDirection(this.camDir);
+		const dir = new THREE.Vector3(this.camDir.x, 0, this.camDir.z);
+		if (dir.lengthSq() < 1e-6) dir.set(p.orientation.x, 0, p.orientation.z);
+		dir.normalize();
+		const ps = this.sizeOf(p);
+		const origin = new THREE.Vector3(p.position.x, p.position.y + 0.25 * ps, p.position.z);
+		this.broadcastCombatShot(origin, dir, (Number(d.range) || 1.4) * ps, Number(d.damage) || 10);
 		if (npcs && typeof npcs.hitTest === 'function')
 		{
-			const cam = this.world.camera;
-			cam.getWorldDirection(this.camDir);
-			const dir = new THREE.Vector3(this.camDir.x, 0, this.camDir.z);
-			if (dir.lengthSq() < 1e-6) dir.set(p.orientation.x, 0, p.orientation.z);
-			dir.normalize();
-			const ps = this.sizeOf(p);
-			const origin = new THREE.Vector3(p.position.x, p.position.y + 0.25 * ps, p.position.z);
 			try
 			{
 				const h = npcs.hitTest(origin, dir, (Number(d.range) || 1.4) * ps);
@@ -808,6 +819,25 @@ export class WeaponSystem implements IUpdatable
 			catch (e) { console.warn('[Realism] NPC punch failed', e); }
 		}
 		this.audio.punch(hit);
+	}
+
+	private broadcastCombatShot(origin: THREE.Vector3, direction: THREE.Vector3, range: number, damage: number): void
+	{
+		this.broadcastCombatShots([{
+			origin: { x: origin.x, y: origin.y, z: origin.z },
+			direction: { x: direction.x, y: direction.y, z: direction.z },
+			range: range,
+			damage: damage,
+		}]);
+	}
+
+	private broadcastCombatShots(shots: any[]): void
+	{
+		const rrmp = (window as any).RRMP;
+		if (rrmp && typeof rrmp.broadcastShots === 'function')
+		{
+			rrmp.broadcastShots(shots);
+		}
 	}
 
 	// -----------------------------------------------------------------------

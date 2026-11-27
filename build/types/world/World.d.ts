@@ -43,6 +43,14 @@ export declare class World {
     paths: Path[];
     scenarioGUIFolder: any;
     updatables: IUpdatable[];
+    worldBounds: {
+        half: number;
+        minY: number;
+    };
+    respawnPosition: CANNON.Vec3;
+    realismMap: any;
+    realismVehicleTypes: any;
+    gui: any;
     private lastScenarioID;
     constructor(worldScenePath?: any);
     update(timeStep: number, unscaledTimeStep: number): void;

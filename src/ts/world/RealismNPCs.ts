@@ -21,9 +21,8 @@
  *  - Errands: walk to a shop, go inside (despawn for a while), then another shop, a stroll, or home.
  *    At night (world.realismTime.hour, if another system provides it) most people go home.
  *  - Population: every person is a cheap abstract agent (a position along a path). Only the nearest
- *    walking / sitting people inside npcs.radius get a body: a pooled clone of Sketchbook's boxman
- *    (walk / idle / sprint / sitting animations, per-person clothes via vertex colours, ONE shared
- *    material). maxVisible bodies at most = maxVisible draw calls.
+ *    walking / sitting people inside npcs.radius get a body: a pooled male/female GLB clone with
+ *    walk/run animation and per-person skin tone variation. maxVisible bodies at most = maxVisible draw calls.
  *  - Size: people are drawn at the player's scale (contract C5: world.realismPlayerScale when the
  *    player system has set it, else REALISM_CONFIG.player.scale, default 1). Walk speed, stride, hit boxes, colliders and the
  *    "step aside" radius scale with it.
@@ -467,6 +466,12 @@ interface Agent
 	look: number;                    // clothing seed
 	scale: number;                   // personal size (times the player scale when drawn)
 	req: { from: number; to: number; startDest: number; endDest: number; mid: boolean } | null;
+	detained: boolean;
+	stunTimer: number;
+	stunState: number;
+	stunAgentTimer: number;
+	stunLeg: Leg;
+	stunProg: number;
 }
 
 interface RosterEntry { role: number; home: number; seat: number; key: number; }
@@ -476,12 +481,20 @@ export interface NPCBody
 {
 	root: THREE.Object3D;
 	tilt: THREE.Object3D;
+	visual: THREE.Group;
 	model: THREE.Object3D;
 	mixer: THREE.AnimationMixer;
 	walk: THREE.AnimationAction;
 	idle: THREE.AnimationAction;
 	run: THREE.AnimationAction;
 	sit: THREE.AnimationAction;
+	variantIndex: number;
+	modelBaseScale: number;
+	modelBaseMinY: number;
+	modelFitScale: number;
+	modelFitY: number;
+	modelSeatedScale: number;
+	modelSeatedY: number;
 	wWalk: number; wRun: number; wSit: number;
 	agent: Agent;
 	geom: THREE.BufferGeometry;      // own copy (clothes colours)
@@ -550,7 +563,8 @@ export class RealismNPCs implements IUpdatable
 	private havePlayer = false;
 	private playerOnFoot = false;
 	private gltf: any = null;
-	private modelState = 0;          // 0 loading, 1 boxman, 2 stand-in
+	private modelState = 0;          // 0 loading, 1 GLB models loaded, 2 stand-in
+	private modelVariants: any[] = [];
 	private sharedMat: THREE.Material = null;
 	private clips: { walk: THREE.AnimationClip; idle: THREE.AnimationClip; run: THREE.AnimationClip; sit: THREE.AnimationClip } = null;
 	private bodyPool: CANNON.Body[] = [];
@@ -919,6 +933,7 @@ export class RealismNPCs implements IUpdatable
 			id: this.nextId++, role: spec.role, home: spec.home, seat: spec.seat, state: S_HOME, timer: r(1) * 50, leg: null, prog: 0, seg: 0, dir: 1,
 			speed: 0, baseSpeed: jog ? 2.6 + r(2) * 0.6 : 1.2 + r(2) * 0.45, lane: 0.25 + r(3) * 0.35, laneBoost: 0, blocked: 0, waiting: false, flee: 0, pendingFlee: 0, pose: 0,
 			x: 0, y: 0, z: 0, hx: 0, hz: 1, vis: null, health: 100, at: -1, look: Math.floor(r(4) * 100000), scale: 0.93 + r(5) * 0.12, req: null,
+			detained: false, stunTimer: 0, stunState: S_WALK, stunAgentTimer: 0, stunLeg: null, stunProg: 0,
 		};
 		this.wake(a, true, r(6));
 		return a;
@@ -1252,6 +1267,17 @@ export class RealismNPCs implements IUpdatable
 
 	private stepAgent(a: Agent, dt: number): void
 	{
+		if (a.detained) return;
+		if (a.stunTimer > 0)
+		{
+			a.stunTimer = Math.max(0, a.stunTimer - dt);
+			if (a.stunTimer > 0) return;
+			a.state = a.stunState;
+			a.timer = a.stunAgentTimer;
+			a.leg = a.stunLeg;
+			a.prog = a.stunProg;
+			a.stunLeg = null;
+		}
 		if (a.state === S_OFF) return;
 		if (a.state === S_HOME || a.state === S_INSIDE || a.state === S_DEAD || a.state === S_STAND)
 		{
@@ -1330,16 +1356,128 @@ export class RealismNPCs implements IUpdatable
 
 	private loadModel(): void
 	{
-		loadSharedModel('build/assets/boxman.glb', (gltf) =>
+		const paths = [
+			{ key: 'male', path: 'build/assets/characters/male.glb' },
+			{ key: 'female', path: 'build/assets/characters/female.glb' },
+			{ key: 'femaleAthlete', path: 'build/assets/characters/female-athlete.glb' },
+		];
+		const loaded: any[] = [];
+		let pending = paths.length;
+		const finish = (): void =>
 		{
-			try { this.useBoxman(gltf); }
-			catch (e) { console.warn('[Realism] NPCs: boxman setup failed, using stand-ins', e); this.modelState = 2; }
-		}, () => { this.modelState = 2; });
+			pending--;
+			if (pending !== 0) return;
+			const models = loaded.filter((model) => !!model);
+			try
+			{
+				if (models.length) this.useCharacterModels(models);
+				else loadSharedModel('build/assets/boxman.glb', (gltf) =>
+				{
+					try { this.useBoxman(gltf); }
+					catch (error) { console.warn('[Realism] NPCs: boxman setup failed, using stand-ins', error); this.modelState = 2; }
+				}, () => { this.modelState = 2; });
+			}
+			catch (error)
+			{
+				console.warn('[Realism] NPC character models could not be initialized', error);
+				this.modelState = 2;
+			}
+		};
+		for (let i = 0; i < paths.length; i++)
+		{
+			loadSharedModel(paths[i].path, (gltf) => { loaded[i] = { key: paths[i].key, gltf }; finish(); }, finish);
+		}
+	}
+
+	private createPoseClip(scene: THREE.Object3D, name: string, seated: boolean): THREE.AnimationClip
+	{
+		const bones: { [name: string]: THREE.Bone } = {};
+		scene.traverse((node: any) => { if (node.isBone) bones[node.name] = node; });
+		const tracks: THREE.KeyframeTrack[] = [];
+		const addRotation = (boneName: string, angle: number): void =>
+		{
+			const bone = bones[boneName];
+			if (!bone) return;
+			const offset = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), angle);
+			const pose = bone.quaternion.clone().multiply(offset);
+			const value = [pose.x, pose.y, pose.z, pose.w];
+			tracks.push(new THREE.QuaternionKeyframeTrack(boneName + '.quaternion', [0, 1], value.concat(value)));
+		};
+		if (seated)
+		{
+			addRotation('LeftUpLeg', 0.9);
+			addRotation('RightUpLeg', 0.9);
+			addRotation('LeftLeg', -1.35);
+			addRotation('RightLeg', -1.35);
+		}
+		else
+		{
+			addRotation('Spine', 0.012);
+			addRotation('Head', -0.01);
+		}
+		return new THREE.AnimationClip(name, 1, tracks);
+	}
+
+	private useCharacterModels(gltfs: any[]): void
+	{
+		this.modelVariants = [];
+		for (let i = 0; i < gltfs.length; i++)
+		{
+			const entry = gltfs[i];
+			const gltf = entry.gltf;
+			const playerSettings: any = (this.ctx.cfg as any).player || {};
+			const modelSettings = playerSettings.models && playerSettings.models[entry.key] || {};
+			gltf.scene.updateMatrixWorld(true);
+			const bounds = new THREE.Box3().setFromObject(gltf.scene);
+			const height = bounds.max.y - bounds.min.y;
+			if (!Number.isFinite(height) || height <= 0.001)
+			{
+				console.warn('[Realism] NPC character GLB has invalid scene bounds; skipping model variant', i, height);
+				continue;
+			}
+			let map: THREE.Texture = null;
+			gltf.scene.traverse((node: any) =>
+			{
+				if (node.isMesh && node.material && node.material.map && !map) map = node.material.map;
+			});
+			const options: any = { map, skinning: true, vertexColors: THREE.VertexColors };
+			const material: any = this.ctx.preset.lighting === 'lambert'
+				? new THREE.MeshLambertMaterial(options)
+				: new THREE.MeshPhongMaterial(Object.assign({ shininess: 0 }, options));
+			material.name = 'npcCharacter_' + i;
+			try { this.ctx.world.sky.csm.setupMaterial(material); } catch (e) { /* no csm */ }
+			const find = (name: string) => THREE.AnimationClip.findByName(gltf.animations, name);
+			const walk = find('walk') || find('run');
+			const run = find('run') || walk;
+			if (!walk || !run) continue;
+			this.modelVariants.push({
+				key: entry.key,
+				gltf,
+				baseScale: Number(modelSettings.height) > 0 ? Number(modelSettings.height) / height : 1.7 / height,
+				minY: bounds.min.y,
+				scale: Number(modelSettings.scale) > 0 ? Number(modelSettings.scale) : 1,
+				y: Number.isFinite(Number(modelSettings.y)) ? Number(modelSettings.y) : 0,
+				seatedScale: Number(modelSettings.seatedScale) > 0 ? Number(modelSettings.seatedScale) : 0.72,
+				seatedY: Number.isFinite(Number(modelSettings.seatedY)) ? Number(modelSettings.seatedY) : 0,
+				material,
+				clips: {
+					walk,
+					run,
+					idle: this.createPoseClip(gltf.scene, 'npc_idle_' + i, false),
+					sit: this.createPoseClip(gltf.scene, 'npc_sit_' + i, true),
+				},
+			});
+		}
+		if (!this.modelVariants.length) throw new Error('No usable male or female NPC GLB models were loaded.');
+		this.modelState = 1;
+		this.resetBodyPool();
+		console.log('[Realism] NPC GLB models ready:', this.modelVariants.length);
 	}
 
 	private useBoxman(gltf: any): void
 	{
 		this.gltf = gltf;
+		this.modelVariants = [];
 		const find = (name: string) => THREE.AnimationClip.findByName(gltf.animations, name);
 		this.clips = { walk: find('run'), idle: find('idle'), run: find('sprint') || find('run'), sit: find('sitting') || find('idle') };
 		let map: THREE.Texture = null;
@@ -1350,23 +1488,58 @@ export class RealismNPCs implements IUpdatable
 		try { this.ctx.world.sky.csm.setupMaterial(mat); } catch (e) { /* no csm */ }
 		this.sharedMat = mat;
 		this.modelState = 1;
-		// drop stand-ins made before the model arrived
+		this.resetBodyPool();
+	}
+
+	private resetBodyPool(): void
+	{
 		for (let i = 0; i < this.bodies.length; i++) { const b = this.bodies[i]; if (b.agent) this.releaseBody(b.agent); }
 		for (let i = 0; i < this.bodies.length; i++) this.ctx.world.graphicsWorld.remove(this.bodies[i].root);
 		this.bodies = []; this.free = [];
 	}
 
-	private newBody(): NPCBody
+	private newBody(variantIndex: number = -1): NPCBody
 	{
 		const root = new THREE.Group();
 		root.name = 'npc';
 		const tilt = new THREE.Group();
 		root.add(tilt);
+		const visual = new THREE.Group();
+		tilt.add(visual);
 		const cast = !!this.ctx.preset.shadows;
 		let model: THREE.Object3D, mixer: THREE.AnimationMixer = null, geom: THREE.BufferGeometry = null;
 		const legs: THREE.Object3D[] = [];
 		let walk: THREE.AnimationAction = null, idle: THREE.AnimationAction = null, run: THREE.AnimationAction = null, sit: THREE.AnimationAction = null;
-		if (this.modelState === 1)
+		let modelBaseScale = 1, modelBaseMinY = 0, modelFitScale = 1, modelFitY = 0;
+		let modelSeatedScale = 1, modelSeatedY = 0;
+		const variant = variantIndex >= 0 ? this.modelVariants[variantIndex] : null;
+		if (variant)
+		{
+			model = SkeletonUtils.clone(variant.gltf.scene) as THREE.Object3D;
+			modelBaseScale = variant.baseScale;
+			modelBaseMinY = variant.minY;
+			modelFitScale = variant.scale;
+			modelFitY = variant.y;
+			modelSeatedScale = variant.seatedScale;
+			modelSeatedY = variant.seatedY;
+			model.traverse((node: any) =>
+			{
+				if (!node.isMesh) return;
+				node.geometry = (node.geometry as THREE.BufferGeometry).clone();
+				if (!geom) geom = node.geometry;
+				node.material = variant.material.clone();
+				node.castShadow = cast; node.receiveShadow = true;
+				node.frustumCulled = false;
+			});
+			mixer = new THREE.AnimationMixer(model);
+			walk = mixer.clipAction(variant.clips.walk);
+			idle = mixer.clipAction(variant.clips.idle);
+			run = mixer.clipAction(variant.clips.run);
+			sit = mixer.clipAction(variant.clips.sit);
+			walk.play(); idle.play(); run.play(); sit.play();
+			walk.setEffectiveWeight(1); idle.setEffectiveWeight(0); run.setEffectiveWeight(0); sit.setEffectiveWeight(0);
+		}
+		else if (this.modelState === 1 && this.gltf)
 		{
 			model = SkeletonUtils.clone(this.gltf.scene) as THREE.Object3D;
 			model.traverse((o: any) =>
@@ -1399,10 +1572,12 @@ export class RealismNPCs implements IUpdatable
 			}
 			model.traverse((o: any) => { if (o.isMesh) { o.castShadow = cast; o.receiveShadow = true; } });
 		}
-		tilt.add(model);
+		visual.add(model);
 		root.visible = false;
 		this.ctx.world.graphicsWorld.add(root);
-		const b: NPCBody = { root: root, tilt: tilt, model: model, mixer: mixer, walk: walk, idle: idle, run: run, sit: sit, wWalk: 1, wRun: 0, wSit: 0, agent: null,
+		const b: NPCBody = { root: root, tilt: tilt, visual: visual, model: model, mixer: mixer, walk: walk, idle: idle, run: run, sit: sit,
+			variantIndex, modelBaseScale, modelBaseMinY, modelFitScale, modelFitY, modelSeatedScale, modelSeatedY,
+			wWalk: 1, wRun: 0, wSit: 0, agent: null,
 			geom: geom, legs: legs, deadT: 0, fallAxis: 0, animAcc: 0, frame: 0, body: null, alive: false };
 		this.bodies.push(b);
 		return b;
@@ -1443,18 +1618,37 @@ export class RealismNPCs implements IUpdatable
 			{
 				let bi = 0, bw = -1;
 				for (let k = 0; k < 4; k++) { const w = sw ? (sw.array as any)[v * sw.itemSize + k] : 0; if (w > bw) { bw = w; bi = si ? (si.array as any)[v * si.itemSize + k] : 0; } }
-				const name: string = bones[bi] ? bones[bi].name : '';
-				let c = shirt;
-				if (name.indexOf('head') >= 0) c = skin;
-				else if (name.indexOf('arm_lower') >= 0) c = sleeves ? shirt : skin;
-				else if (name.indexOf('leg') >= 0 || name.indexOf('body_lower') >= 0 || name.indexOf('butt') >= 0 || name === 'root') c = pants;
-				if (name.indexOf('leg_lower') >= 0 && pos.getY(v) < minY + (maxY - minY) * 0.07) c = shoes;
+				const name: string = bones[bi] ? bones[bi].name.toLowerCase() : '';
+				let c = [1, 1, 1];
+				if (b.variantIndex < 0)
+				{
+					c = shirt;
+					if (name.indexOf('head') >= 0) c = skin;
+					else if (name.indexOf('arm_lower') >= 0) c = sleeves ? shirt : skin;
+					else if (name.indexOf('leg') >= 0 || name.indexOf('body_lower') >= 0 || name.indexOf('butt') >= 0 || name === 'root') c = pants;
+					if (name.indexOf('leg_lower') >= 0 && pos.getY(v) < minY + (maxY - minY) * 0.07) c = shoes;
+				}
+				else if (name.indexOf('head') >= 0 || name.indexOf('neck') >= 0 || name.indexOf('hand') >= 0 ||
+					(!sleeves && (name.indexOf('arm') >= 0 || name.indexOf('forearm') >= 0)))
+				{
+					c = skin;
+				}
 				arr[v * 3] = c[0]; arr[v * 3 + 1] = c[1]; arr[v * 3 + 2] = c[2];
 			}
 			col.needsUpdate = true;
 		}
-		const s = (b.agent ? b.agent.scale : 1) * this.playerScale;
-		b.model.scale.set(s, s, s);
+		this.applyBodyFit(b);
+	}
+
+	private applyBodyFit(b: NPCBody): void
+	{
+		const agentScale = b.agent ? b.agent.scale : 1;
+		const playerScale = b.variantIndex >= 0 ? 1 : this.playerScale;
+		const seatScale = 1 + (b.modelSeatedScale - 1) * b.wSit;
+		const fittedScale = agentScale * playerScale * b.modelBaseScale * b.modelFitScale * seatScale;
+		b.visual.scale.set(fittedScale, fittedScale, fittedScale);
+		const yOffset = b.modelFitY + (b.modelSeatedY - b.modelFitY) * b.wSit;
+		b.visual.position.y = -b.modelBaseMinY * fittedScale + yOffset;
 	}
 
 	private assignBody(a: Agent): void
@@ -1464,7 +1658,8 @@ export class RealismNPCs implements IUpdatable
 		if (b === undefined)
 		{
 			if (this.bodies.length >= this.settings.maxVisible) return;
-			b = this.newBody();
+			const variantIndex = this.modelVariants.length ? Math.floor(hash01(a.look + 97.31) * this.modelVariants.length) : -1;
+			b = this.newBody(variantIndex);
 		}
 		b.agent = a; a.vis = b;
 		b.alive = true; b.deadT = 0;
@@ -1744,14 +1939,15 @@ export class RealismNPCs implements IUpdatable
 				b.wWalk += ((moving && !running ? 1 : 0) - b.wWalk) * fade;
 				b.wRun += ((running ? 1 : 0) - b.wRun) * fade;
 				b.wSit += ((sitting ? 1 : 0) - b.wSit) * fade;
+				if (b.variantIndex >= 0) this.applyBodyFit(b);
 				if (b.mixer)
 				{
 					b.walk.setEffectiveWeight(b.wWalk);
 					b.run.setEffectiveWeight(b.wRun);
 					b.sit.setEffectiveWeight(b.wSit);
 					b.idle.setEffectiveWeight(Math.max(0, 1 - b.wWalk - b.wRun - b.wSit));
-					b.walk.timeScale = Math.max(0.3, a.baseSpeed * 0.42);
-					b.run.timeScale = a.flee > 0 ? 1.05 : 0.8;
+					b.walk.timeScale = Math.max(0.75, Math.min(1.25, a.baseSpeed / 1.5));
+					b.run.timeScale = a.flee > 0 ? 1.05 : 1;
 					b.mixer.update(st);
 				}
 				else if (b.legs.length)
@@ -1845,6 +2041,45 @@ export class RealismNPCs implements IUpdatable
 		}
 		if (!best) return null;
 		return { distance: bt, point: new THREE.Vector3(origin.x + d.x * bt, origin.y + d.y * bt, origin.z + d.z * bt), npc: best };
+	}
+
+	/** Briefly pauses an NPC without applying damage. */
+	public stun(npc: any, duration: number = 5): boolean
+	{
+		const b: NPCBody = npc && npc.root ? npc : (npc && npc.vis ? npc.vis : null);
+		if (!b || !b.agent || !b.alive || b.agent.detained) return false;
+		const a = b.agent;
+		if (a.stunTimer <= 0)
+		{
+			a.stunState = a.state;
+			a.stunAgentTimer = a.timer;
+			a.stunLeg = a.leg;
+			a.stunProg = a.prog;
+		}
+		a.stunTimer = Math.max(a.stunTimer, Math.max(0.5, Math.min(20, duration)));
+		a.state = S_STAND;
+		a.pose = 0;
+		a.timer = a.stunTimer;
+		a.leg = null;
+		a.speed = 0;
+		return true;
+	}
+
+	/** Applies or releases temporary in-game custody on an NPC. */
+	public setDetained(npc: any, detained: boolean): boolean
+	{
+		const b: NPCBody = npc && npc.root ? npc : (npc && npc.vis ? npc.vis : null);
+		if (!b || !b.agent || !b.alive) return false;
+		const a = b.agent;
+		a.detained = detained === true;
+		a.stunTimer = 0;
+		a.stunLeg = null;
+		a.state = S_STAND;
+		a.pose = 0;
+		a.leg = null;
+		a.speed = 0;
+		a.timer = detained ? 1e9 : 0;
+		return true;
 	}
 
 	/** Damages a person (the `npc` from hitTest). 100 health; at 0 they fall over. Everyone near runs. */
@@ -1982,6 +2217,7 @@ export class RealismNPCs implements IUpdatable
 			id: this.nextId++, role: R_TEMP, home: -1, seat: 0, state: S_WALK, timer: 0, leg: null, prog: 0, seg: 0, dir: 1,
 			speed: 0, baseSpeed: 1.3, lane: 0.3, laneBoost: 0, blocked: 0, waiting: false, flee: 0, pendingFlee: 0, pose: 0,
 			x: x, y: y, z: z, hx: x - fromX, hz: z - fromZ, vis: null, health: 100, at: -1, look: look, scale: 0.95 + Math.random() * 0.1, req: null,
+			detained: false, stunTimer: 0, stunState: S_WALK, stunAgentTimer: 0, stunLeg: null, stunProg: 0,
 		};
 		const hl = Math.sqrt(a.hx * a.hx + a.hz * a.hz) || 1; a.hx /= hl; a.hz /= hl;
 		this.extras.push(a);
